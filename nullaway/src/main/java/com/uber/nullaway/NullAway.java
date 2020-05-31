@@ -527,7 +527,6 @@ public class NullAway extends BugChecker
    *     LambdaExpressionTree}; otherwise {@code null}
    * @param memberReferenceTree if the overriding method is a member reference (which "overrides" a
    *     functional interface method), the {@link MemberReferenceTree}; otherwise {@code null}
-   * @return
    */
   private Description checkParamOverriding(
       List<VarSymbol> overridingParamSymbols,
@@ -720,7 +719,7 @@ public class NullAway extends BugChecker
    * @param memberReferenceTree if override is via a method reference, the relevant {@link
    *     MemberReferenceTree}; otherwise {@code null}. If non-null, overridingTree is the AST of the
    *     referenced method
-   * @param state
+   * @param state the visitor state
    * @return discovered error, or {@link Description#NO_MATCH} if no error
    */
   private Description checkOverriding(
@@ -1498,7 +1497,7 @@ public class NullAway extends BugChecker
   /**
    * @param entities relevant entities from class
    * @param notInitializedInConstructors those fields not initialized in some constructor
-   * @param state
+   * @param state the visitor state
    * @return those fields from notInitializedInConstructors that are not initialized in any
    *     initializer method
    */
@@ -2002,7 +2001,7 @@ public class NullAway extends BugChecker
   }
 
   /**
-   * @param kind
+   * @param kind the element kind
    * @return <code>true</code> if a deference of the kind might dereference null, <code>false</code>
    *     otherwise
    */
@@ -2103,12 +2102,7 @@ public class NullAway extends BugChecker
     return errorBuilder;
   }
 
-  /**
-   * strip out enclosing parentheses, type casts and Nullchk operators.
-   *
-   * @param expr
-   * @return
-   */
+  /** strip out enclosing parentheses, type casts and Nullchk operators. */
   private static ExpressionTree stripParensAndCasts(ExpressionTree expr) {
     boolean someChange = true;
     while (someChange) {
@@ -2203,9 +2197,6 @@ public class NullAway extends BugChecker
    *
    * <p>Used by handlers to communicate that an expression should has a more precise nullness than
    * what is known from source annotations.
-   *
-   * @param e
-   * @param nullness
    */
   public void setComputedNullness(ExpressionTree e, Nullness nullness) {
     computedNullnessMap.put(e, nullness);
@@ -2237,10 +2228,10 @@ public class NullAway extends BugChecker
     /** @return symbol for class */
     abstract Symbol.ClassSymbol classSymbol();
 
-    /** @return @NonNull instance fields that are not directly initialized at declaration */
+    /** Returns {@code @NonNull} instance fields that are not directly initialized at declaration */
     abstract ImmutableSet<Symbol> nonnullInstanceFields();
 
-    /** @return @NonNull static fields that are not directly initialized at declaration */
+    /** Returns {@code @NonNull} static fields that are not directly initialized at declaration */
     abstract ImmutableSet<Symbol> nonnullStaticFields();
 
     /**

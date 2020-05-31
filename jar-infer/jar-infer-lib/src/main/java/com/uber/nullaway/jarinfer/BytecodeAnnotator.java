@@ -193,7 +193,6 @@ public final class BytecodeAnnotator {
    * @param nonnullParams Map from methods to their nonnull params.
    * @param nullableReturns List of methods that return nullable.
    * @param debug flag to output debug logs.
-   * @throws IOException
    */
   public static void annotateBytecodeInClass(
       InputStream is,
@@ -262,8 +261,8 @@ public final class BytecodeAnnotator {
    * @param nonnullParams Map from methods to their nonnull params.
    * @param nullableReturns List of methods that return nullable.
    * @param debug flag to output debug logs.
-   * @throws IOException
    */
+  @SuppressWarnings("JdkObsolete") // need to use an Enumeration here
   public static void annotateBytecodeInJar(
       JarFile inputJar,
       JarOutputStream jarOS,
@@ -302,8 +301,8 @@ public final class BytecodeAnnotator {
    * @param nonnullParams Map from methods to their nonnull params.
    * @param nullableReturns List of methods that return nullable.
    * @param debug flag to output debug logs.
-   * @throws IOException
    */
+  @SuppressWarnings("JdkObsolete") // need to use an Enumeration here
   public static void annotateBytecodeInAar(
       ZipFile inputZip,
       ZipOutputStream zipOS,

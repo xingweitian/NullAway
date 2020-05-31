@@ -674,8 +674,6 @@ public class LibraryModelsHandler extends BaseNoOpHandler {
      * Mapping from {@link MethodRef} to some state, where lookups first check for a matching method
      * name as an optimization. The {@link Name} data structure is used to avoid unnecessary String
      * conversions when looking up {@link com.sun.tools.javac.code.Symbol.MethodSymbol}s.
-     *
-     * @param <T>
      */
     private static class NameIndexedMap<T> {
 

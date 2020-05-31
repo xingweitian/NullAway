@@ -1,6 +1,5 @@
 package com.uber.nullaway.benchmark;
 
-import com.google.errorprone.ErrorProneCompiler;
 import com.uber.nullaway.NullAway;
 import java.net.URL;
 import java.util.ArrayList;
@@ -63,8 +62,6 @@ public class NullAwayBenchmarkHarness {
    * flags are being passed. In this case, we assume the annotated packages are passed as the first
    * argument and the remaining javac args as the rest. We run two configs, one with NullAway added
    * in a warning-only mode and one with no NullAway.
-   *
-   * @param args
    */
   private static void addNullAwayArgsAndRun(String[] args) {
     String nullawayJar = getJarFileForClass(NullAway.class).getFile();
@@ -93,12 +90,13 @@ public class NullAwayBenchmarkHarness {
     runCompile(fixedArgs, 7, 10);
   }
 
-  private static void runCompile(List<String> fixedArgs, int warmupRuns, int realRuns) {
-    String[] finalArgs = fixedArgs.toArray(new String[fixedArgs.size()]);
+  private static void runCompile(
+      @SuppressWarnings("UnusedVariable") List<String> fixedArgs, int warmupRuns, int realRuns) {
+    // String[] finalArgs = fixedArgs.toArray(new String[fixedArgs.size()]);
     for (int i = 0; i < warmupRuns; i++) {
       System.out.println("Warmup Run " + (i + 1));
       long startTime = System.nanoTime();
-      ErrorProneCompiler.compile(finalArgs);
+      /*ErrorProneCompiler.compile(finalArgs);*/
       long endTime = System.nanoTime();
       System.out.println("Running time " + (((double) endTime - startTime) / 1000000000.0));
     }
@@ -106,7 +104,7 @@ public class NullAwayBenchmarkHarness {
     for (int i = 0; i < realRuns; i++) {
       System.out.println("Real Run " + (i + 1));
       long startTime = System.nanoTime();
-      ErrorProneCompiler.compile(finalArgs);
+      /*ErrorProneCompiler.compile(finalArgs);*/
       long endTime = System.nanoTime();
       long runTime = endTime - startTime;
       System.out.println("Running time " + (((double) runTime) / 1000000000.0));
