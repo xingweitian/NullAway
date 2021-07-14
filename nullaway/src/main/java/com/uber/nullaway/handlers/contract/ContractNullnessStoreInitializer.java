@@ -1,9 +1,7 @@
 package com.uber.nullaway.handlers.contract;
 
-import static com.uber.nullaway.NullabilityUtil.getAnnotationValue;
 import static com.uber.nullaway.Nullness.NONNULL;
 import static com.uber.nullaway.Nullness.NULLABLE;
-import static com.uber.nullaway.handlers.contract.ContractHandler.CONTRACT_ANNOTATION_NAME;
 
 import com.google.errorprone.util.ASTHelpers;
 import com.sun.source.tree.ClassTree;
@@ -19,8 +17,8 @@ import com.uber.nullaway.dataflow.NullnessStoreInitializer;
 import com.uber.nullaway.handlers.Handler;
 import java.util.List;
 import javax.lang.model.element.Element;
-import org.checkerframework.dataflow.cfg.UnderlyingAST;
-import org.checkerframework.dataflow.cfg.node.LocalVariableNode;
+import org.checkerframework.nullaway.dataflow.cfg.UnderlyingAST;
+import org.checkerframework.nullaway.dataflow.cfg.node.LocalVariableNode;
 
 /**
  * Nullness Store initializer in case of dataflow for contract check. The nullability of parameters
@@ -41,7 +39,7 @@ public class ContractNullnessStoreInitializer extends NullnessStoreInitializer {
     final MethodTree methodTree = ((UnderlyingAST.CFGMethod) underlyingAST).getMethod();
     final ClassTree classTree = ((UnderlyingAST.CFGMethod) underlyingAST).getClassTree();
     final Symbol.MethodSymbol callee = ASTHelpers.getSymbol(methodTree);
-    final String contractString = getAnnotationValue(callee, CONTRACT_ANNOTATION_NAME);
+    final String contractString = ContractUtils.getContractString(callee, config);
 
     assert contractString != null;
 

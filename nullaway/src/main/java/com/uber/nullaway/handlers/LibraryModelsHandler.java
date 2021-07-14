@@ -53,8 +53,8 @@ import java.util.ServiceLoader;
 import java.util.Set;
 import java.util.function.Function;
 import javax.annotation.Nullable;
-import org.checkerframework.dataflow.cfg.node.MethodInvocationNode;
-import org.checkerframework.dataflow.cfg.node.Node;
+import org.checkerframework.nullaway.dataflow.cfg.node.MethodInvocationNode;
+import org.checkerframework.nullaway.dataflow.cfg.node.Node;
 
 /**
  * This Handler deals with any methods from unannotated packages for which we need a nullability
@@ -351,6 +351,11 @@ public class LibraryModelsHandler extends BaseNoOpHandler {
                 0)
             .put(methodRef("java.util.Objects", "<T>requireNonNull(T)"), 0)
             .put(methodRef("java.util.Objects", "<T>requireNonNull(T,java.lang.String)"), 0)
+            .put(
+                methodRef(
+                    "java.util.Objects",
+                    "<T>requireNonNull(T,java.util.function.Supplier<java.lang.String>)"),
+                0)
             .put(methodRef("org.junit.Assert", "assertNotNull(java.lang.Object)"), 0)
             .put(
                 methodRef("org.junit.Assert", "assertNotNull(java.lang.String,java.lang.Object)"),
@@ -543,6 +548,7 @@ public class LibraryModelsHandler extends BaseNoOpHandler {
             .add(methodRef("java.lang.ref.PhantomReference", "get()"))
             .add(methodRef("java.lang.ref.SoftReference", "get()"))
             .add(methodRef("java.lang.ref.WeakReference", "get()"))
+            .add(methodRef("java.nio.file.Path", "getParent()"))
             .add(methodRef("java.util.concurrent.atomic.AtomicReference", "get()"))
             .add(methodRef("java.util.Map", "get(java.lang.Object)"))
             .add(methodRef("javax.lang.model.element.Element", "getEnclosingElement()"))
