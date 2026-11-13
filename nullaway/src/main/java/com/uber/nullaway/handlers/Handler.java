@@ -24,102 +24,136 @@ package com.uber.nullaway.handlers;
 
 import com.google.common.collect.ImmutableSet;
 import com.google.errorprone.VisitorState;
-import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.LambdaExpressionTree;
 import com.sun.source.tree.MemberReferenceTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.ReturnTree;
+import com.sun.source.util.TreePath;
 import com.sun.tools.javac.code.Symbol;
+import com.sun.tools.javac.code.Type;
 import com.sun.tools.javac.code.Types;
 import com.sun.tools.javac.util.Context;
 import com.uber.nullaway.ErrorMessage;
+import com.uber.nullaway.LibraryModels;
+import com.uber.nullaway.LibraryModels.PolyNullLocation;
+import com.uber.nullaway.MethodParameterNullness;
 import com.uber.nullaway.NullAway;
 import com.uber.nullaway.Nullness;
 import com.uber.nullaway.dataflow.AccessPath;
+import com.uber.nullaway.dataflow.AccessPathNullnessAnalysis;
 import com.uber.nullaway.dataflow.AccessPathNullnessPropagation;
 import com.uber.nullaway.dataflow.NullnessStore;
+import com.uber.nullaway.dataflow.cfg.NullAwayCFGBuilder;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Predicate;
 import org.checkerframework.nullaway.dataflow.cfg.UnderlyingAST;
+import org.checkerframework.nullaway.dataflow.cfg.node.FieldAccessNode;
 import org.checkerframework.nullaway.dataflow.cfg.node.LocalVariableNode;
 import org.checkerframework.nullaway.dataflow.cfg.node.MethodInvocationNode;
+import org.jspecify.annotations.Nullable;
 
 /**
  * The general interface representing a handler.
  *
  * <p>Handlers are used to model specific libraries and APIs, as opposed to general features of the
  * Java language, which are handled by the nullability checker core and dataflow packages.
+ *
+ * <p>Default no-op implementations are provided for all methods, so that handlers can choose to
+ * implement only the methods they care about.
  */
 public interface Handler {
 
   /**
-   * Called when NullAway matches a particular top level class.
-   *
-   * <p>This also means we are starting a new Compilation Unit, which allows us to clear CU-specific
-   * state.
+   * Called when NullAway matches a compilation unit.
    *
    * @param analysis A reference to the running NullAway analysis.
-   * @param tree The AST node for the class being matched.
+   * @param tree The compilation unit being matched.
    * @param state The current visitor state.
-   * @param classSymbol The class symbol for the class being matched.
    */
-  void onMatchTopLevelClass(
-      NullAway analysis, ClassTree tree, VisitorState state, Symbol.ClassSymbol classSymbol);
+  default void onMatchCompilationUnit(
+      NullAway analysis, CompilationUnitTree tree, VisitorState state) {
+    // NoOp
+  }
 
   /**
    * Called when NullAway first matches a particular method node.
    *
-   * @param analysis A reference to the running NullAway analysis.
    * @param tree The AST node for the method being matched.
-   * @param state The current visitor state.
-   * @param methodSymbol The method symbol for the method being matched.
+   * @param methodAnalysisContext The MethodAnalysisContext object
    */
-  void onMatchMethod(
-      NullAway analysis, MethodTree tree, VisitorState state, Symbol.MethodSymbol methodSymbol);
+  default void onMatchMethod(MethodTree tree, MethodAnalysisContext methodAnalysisContext) {
+    // NoOp
+  }
 
   /**
    * Called when NullAway first matches a particular method call-site.
    *
-   * @param analysis A reference to the running NullAway analysis.
    * @param tree The AST node for the method invocation (call-site) being matched.
-   * @param state The current visitor state.
-   * @param methodSymbol The method symbol for the method being called.
+   * @param methodAnalysisContext The MethodAnalysisContext object
    */
-  void onMatchMethodInvocation(
-      NullAway analysis,
-      MethodInvocationTree tree,
-      VisitorState state,
-      Symbol.MethodSymbol methodSymbol);
+  default void onMatchMethodInvocation(
+      MethodInvocationTree tree, MethodAnalysisContext methodAnalysisContext) {
+    // NoOp
+  }
 
   /**
    * Called when NullAway first matches a particular lambda expression.
    *
-   * @param analysis A reference to the running NullAway analysis.
    * @param tree The AST node for the lambda expression being matched.
-   * @param state The current visitor state.
-   * @param methodSymbol The method symbol for the functional interface of the lambda being matched.
+   * @param methodAnalysisContext The MethodAnalysisContext object
    */
-  void onMatchLambdaExpression(
-      NullAway analysis,
-      LambdaExpressionTree tree,
-      VisitorState state,
-      Symbol.MethodSymbol methodSymbol);
+  default void onMatchLambdaExpression(
+      LambdaExpressionTree tree, MethodAnalysisContext methodAnalysisContext) {
+    // NoOp
+  }
 
   /**
    * Called when NullAway first matches a particular method reference expression
    *
-   * @param analysis A reference to the running NullAway analysis.
    * @param tree The AST node for the method reference expression being matched.
-   * @param state The current visitor state.
-   * @param methodSymbol The method symbol for the reference being matched.
+   * @param methodAnalysisContext The MethodAnalysisContext object
    */
-  void onMatchMethodReference(
-      NullAway analysis,
-      MemberReferenceTree tree,
-      VisitorState state,
-      Symbol.MethodSymbol methodSymbol);
+  default void onMatchMethodReference(
+      MemberReferenceTree tree, MethodAnalysisContext methodAnalysisContext) {
+    // NoOp
+  }
+
+  /**
+   * Returns a hint for a method reference's return nullness based on its functional interface
+   * method.
+   *
+   * <p>Hints from all handlers are combined using {@link NullnessHint#merge(NullnessHint)}. During
+   * return compatibility checking, a merged hint other than {@link NullnessHint#UNKNOWN} replaces
+   * the return nullness computed by {@link #onOverrideMethodReturnNullability}. In JSpecify mode,
+   * it also replaces the referenced return type's top-level nullness, both during generic inference
+   * and when checking the type of a method reference passed as an argument.
+   *
+   * <p>NullAway does not call this hook for raw functional-interface target types, constructor
+   * references, or references where either the referenced or functional interface method is
+   * varargs.
+   *
+   * @param referencedMethod symbol of the referenced method
+   * @param functionalInterfaceMethod symbol of the functional interface method
+   * @param functionalInterfaceMethodType functional interface method type as a member of the ground
+   *     target type in JSpecify mode, or its declared type otherwise
+   * @param isUnbound whether this is an unbound instance method reference, whose first functional
+   *     interface parameter is the receiver
+   * @param state the current visitor state
+   * @return a return-nullness hint, or {@link NullnessHint#UNKNOWN} when this handler has no
+   *     refinement
+   */
+  default NullnessHint onMethodReferenceReturnNullnessHint(
+      Symbol.MethodSymbol referencedMethod,
+      Symbol.MethodSymbol functionalInterfaceMethod,
+      Type.MethodType functionalInterfaceMethodType,
+      boolean isUnbound,
+      VisitorState state) {
+    return NullnessHint.UNKNOWN;
+  }
 
   /**
    * Called when NullAway first matches a return statement.
@@ -128,61 +162,9 @@ public interface Handler {
    * @param tree The AST node for the return statement being matched.
    * @param state The current visitor state.
    */
-  void onMatchReturn(NullAway analysis, ReturnTree tree, VisitorState state);
-
-  /**
-   * Called when NullAway encounters an unannotated method and asks for params explicitly
-   * marked @Nullable
-   *
-   * <p>This is mostly used to force overriding methods to also use @Nullable, e.g. for callbacks
-   * that can get passed null values.
-   *
-   * <p>Note that this should be only used for parameters EXPLICLTY marked as @Nullable (e.g. by
-   * library models) rather than those considered @Nullable by NullAway's default optimistic
-   * assumptions.
-   *
-   * @param methodSymbol The method symbol for the unannotated method in question.
-   * @param explicitlyNullablePositions Parameter nullability computed by upstream handlers (the
-   *     core analysis supplies the empty set to the first handler in the chain).
-   * @return Updated parameter nullability computed by this handler.
-   */
-  ImmutableSet<Integer> onUnannotatedInvocationGetExplicitlyNullablePositions(
-      Context context,
-      Symbol.MethodSymbol methodSymbol,
-      ImmutableSet<Integer> explicitlyNullablePositions);
-
-  /**
-   * Called when NullAway encounters an unannotated method and asks if return value is explicitly
-   * marked @Nullable
-   *
-   * <p>Note that this should be only used for return values EXPLICLTY marked as @NonNull (e.g. by
-   * library models) rather than those considered @Nullable by NullAway's default optimistic
-   * assumptions.
-   *
-   * @param methodSymbol The method symbol for the unannotated method in question.
-   * @param explicitlyNonNullReturn return nullability computed by upstream handlers.
-   * @return Updated return nullability computed by this handler.
-   */
-  boolean onUnannotatedInvocationGetExplicitlyNonNullReturn(
-      Symbol.MethodSymbol methodSymbol, boolean explicitlyNonNullReturn);
-
-  /**
-   * Called when NullAway encounters an unannotated method and asks for params default nullability
-   *
-   * @param analysis A reference to the running NullAway analysis.
-   * @param state The current visitor state.
-   * @param methodSymbol The method symbol for the unannotated method in question.
-   * @param actualParams The actual parameters from the invocation node
-   * @param nonNullPositions Parameter nullability computed by upstream handlers (the core analysis
-   *     supplies the empty set to the first handler in the chain).
-   * @return Updated parameter nullability computed by this handler.
-   */
-  ImmutableSet<Integer> onUnannotatedInvocationGetNonNullPositions(
-      NullAway analysis,
-      VisitorState state,
-      Symbol.MethodSymbol methodSymbol,
-      List<? extends ExpressionTree> actualParams,
-      ImmutableSet<Integer> nonNullPositions);
+  default void onMatchReturn(NullAway analysis, ReturnTree tree, VisitorState state) {
+    // NoOp
+  }
 
   /**
    * Called after the analysis determines if a expression can be null or not, allowing handlers to
@@ -190,13 +172,95 @@ public interface Handler {
    *
    * @param analysis A reference to the running NullAway analysis.
    * @param expr The expression in question.
+   * @param exprSymbol The symbol of the expression, might be null
    * @param state The current visitor state.
    * @param exprMayBeNull Whether or not the expression may be null according to the base analysis
    *     or upstream handlers.
    * @return Whether or not the expression may be null, as updated by this handler.
    */
-  boolean onOverrideMayBeNullExpr(
-      NullAway analysis, ExpressionTree expr, VisitorState state, boolean exprMayBeNull);
+  default boolean onOverrideMayBeNullExpr(
+      NullAway analysis,
+      ExpressionTree expr,
+      @Nullable Symbol exprSymbol,
+      VisitorState state,
+      boolean exprMayBeNull) {
+    // NoOp
+    return exprMayBeNull;
+  }
+
+  /**
+   * Called to potentially override the nullability of an annotated or unannotated method's return,
+   * when only the method symbol (and not a full invocation tree) is available. This is used
+   * primarily for checking subtyping / method overrides.
+   *
+   * @param methodSymbol The method symbol for the method in question.
+   * @param state The current visitor state.
+   * @param isAnnotated A boolean flag indicating whether the called method is considered to be
+   *     within annotated or unannotated code, used to avoid querying for this information multiple
+   *     times within the same handler chain.
+   * @param returnNullness return nullness computed by upstream handlers or NullAway core.
+   * @return Updated return nullability computed by this handler.
+   */
+  default Nullness onOverrideMethodReturnNullability(
+      Symbol.MethodSymbol methodSymbol,
+      VisitorState state,
+      boolean isAnnotated,
+      Nullness returnNullness) {
+    // NoOp
+    return returnNullness;
+  }
+
+  /**
+   * Called to potentially override the nullability of a field which is not annotated as @Nullable.
+   * If the field is decided to be @Nullable by this handler, the field should be treated
+   * as @Nullable anyway.
+   *
+   * @param field The symbol for the field in question.
+   * @return true if the field should be treated as @Nullable, false otherwise.
+   */
+  default boolean onOverrideFieldNullability(Symbol field) {
+    // NoOp
+    return false;
+  }
+
+  /**
+   * Called after the analysis determines the nullability of a method's arguments, allowing handlers
+   * to override.
+   *
+   * <p>The passed Map object maps argument positions to nullness information and is sparse, where
+   * the nullness of missing indexes is determined by base analysis and depends on if the code is
+   * considered isAnnotated or not. We use a mutable map for performance, but it should not outlive
+   * the chain of handler invocations.
+   *
+   * <p>Where every handler leaves a position unset, a parameter whose type is a type variable
+   * {@code T}, declared without {@code @NonNull} as a type variable whose upper bound is nullable,
+   * accepts a value for which {@link com.uber.nullaway.Nullness#isNoChange()} holds, such as {@code
+   * box.get()} on a {@code Box<? extends T>}. A position that a handler sets to NONNULL, even to
+   * the value it already holds, rejects that value, so a handler sets only the positions it models.
+   *
+   * @param context The current context.
+   * @param methodSymbol The method symbol for the method in question.
+   * @param isAnnotated A boolean flag indicating whether the called method is considered to be
+   *     within isAnnotated or unannotated code, used to avoid querying for this information
+   *     multiple times within the same handler chain.
+   * @param argumentNullness Nullness info for each argument position as computed by upstream
+   *     handlers and/or the base analysis. Some parameter entries may be {@code null}, indicating
+   *     upstream handlers and the base analysis consider the parameter to be nullness-unknown,
+   *     usually since the parameter is from unannotated code. For a varargs parameter, the formal
+   *     parameter slot stores the nullness for when individual parameters are passed in the varargs
+   *     position, while {@link MethodParameterNullness#getVarargsArrayNullness()} stores the
+   *     nullness of the varargs array itself.
+   * @return The updated nullness info for each argument position, as computed by the current
+   *     handler.
+   */
+  default MethodParameterNullness onOverrideMethodInvocationParametersNullability(
+      Context context,
+      Symbol.MethodSymbol methodSymbol,
+      boolean isAnnotated,
+      MethodParameterNullness argumentNullness) {
+    // NoOp
+    return argumentNullness;
+  }
 
   /**
    * Called when the Dataflow analysis generates the initial NullnessStore for a method or lambda.
@@ -211,16 +275,19 @@ public interface Handler {
    *     take {@code result} and call {@code setInformation(...)} on it to add additional nullness
    *     facts, or replace it with a new builder altogether.
    */
-  NullnessStore.Builder onDataflowInitialStore(
+  default NullnessStore.Builder onDataflowInitialStore(
       UnderlyingAST underlyingAST,
       List<LocalVariableNode> parameters,
-      NullnessStore.Builder result);
+      NullnessStore.Builder result) {
+    return result;
+  }
 
   /**
    * Called when the Dataflow analysis visits each method invocation.
    *
    * @param node The AST node for the method callsite.
-   * @param types {@link Types} for the current compilation
+   * @param symbol The symbol of the called method
+   * @param state The current visitor state.
    * @param apContext the current access path context information (see {@link
    *     AccessPath.AccessPathContext}).
    * @param inputs NullnessStore information known before the method invocation.
@@ -230,19 +297,47 @@ public interface Handler {
    *     the set() method.
    * @param bothUpdates NullnessStore updates to be added along both paths, handlers can add via the
    *     set() method.
-   * @return The Nullness information for this method's return computed by this handler. See
-   *     NullnessHint and CompositeHandler for more information about how this values get merged
-   *     into a final Nullness value.
+   * @return a hint for the method call's result nullness; hints from different handlers are
+   *     combined using {@link NullnessHint#merge(NullnessHint)}
    */
-  NullnessHint onDataflowVisitMethodInvocation(
+  default NullnessHint onDataflowVisitMethodInvocation(
       MethodInvocationNode node,
-      Types types,
-      Context context,
+      Symbol.MethodSymbol symbol,
+      VisitorState state,
       AccessPath.AccessPathContext apContext,
       AccessPathNullnessPropagation.SubNodeValues inputs,
       AccessPathNullnessPropagation.Updates thenUpdates,
       AccessPathNullnessPropagation.Updates elseUpdates,
-      AccessPathNullnessPropagation.Updates bothUpdates);
+      AccessPathNullnessPropagation.Updates bothUpdates) {
+    // NoOp
+    return NullnessHint.UNKNOWN;
+  }
+
+  /**
+   * Called when the Dataflow analysis visits each field access.
+   *
+   * @param node The AST node for the field access.
+   * @param symbol The {@link Symbol} object for the above node, provided for convenience.
+   * @param types {@link Types} for the current compilation
+   * @param context the javac Context object (or Error Prone SubContext)
+   * @param apContext the current access path context information (see {@link
+   *     AccessPath.AccessPathContext}).
+   * @param inputs NullnessStore information known before the method invocation.
+   * @param updates NullnessStore updates to be added, handlers can add via the set() method.
+   * @return a hint for the field value's nullness; hints from different handlers are combined using
+   *     {@link NullnessHint#merge(NullnessHint)}
+   */
+  default NullnessHint onDataflowVisitFieldAccess(
+      FieldAccessNode node,
+      Symbol symbol,
+      Types types,
+      Context context,
+      AccessPath.AccessPathContext apContext,
+      AccessPathNullnessPropagation.SubNodeValues inputs,
+      AccessPathNullnessPropagation.Updates updates) {
+    // NoOp
+    return NullnessHint.UNKNOWN;
+  }
 
   /**
    * Called when the Dataflow analysis visits a return statement.
@@ -253,7 +348,10 @@ public interface Handler {
    * @param elseStore The NullnessStore for the false case of the expression inside the return
    *     statement.
    */
-  void onDataflowVisitReturn(ReturnTree tree, NullnessStore thenStore, NullnessStore elseStore);
+  default void onDataflowVisitReturn(
+      ReturnTree tree, NullnessStore thenStore, NullnessStore elseStore) {
+    // NoOp
+  }
 
   /**
    * Called when the Dataflow analysis visits the result expression inside the body of lambda.
@@ -273,8 +371,10 @@ public interface Handler {
    * @param elseStore The NullnessStore for the false case of the expression inside the return
    *     statement.
    */
-  void onDataflowVisitLambdaResultExpression(
-      ExpressionTree tree, NullnessStore thenStore, NullnessStore elseStore);
+  default void onDataflowVisitLambdaResultExpression(
+      ExpressionTree tree, NullnessStore thenStore, NullnessStore elseStore) {
+    // NoOp
+  }
 
   /**
    * It should return an error wrapped in Optional if any of the handlers detect an error in
@@ -286,19 +386,25 @@ public interface Handler {
    * @return {@link ErrorMessage} wrapped in {@link Optional} if dereference causes some error,
    *     otherwise returns empty Optional
    */
-  Optional<ErrorMessage> onExpressionDereference(
-      ExpressionTree expr, ExpressionTree baseExpr, VisitorState state);
+  default Optional<ErrorMessage> onExpressionDereference(
+      ExpressionTree expr, ExpressionTree baseExpr, VisitorState state) {
+    return Optional.empty();
+  }
 
   /**
-   * Called when the store access paths are filtered for local variable information before an
-   * expression.
+   * Called when determining which access path nullability information should be preserved when
+   * analyzing a nested method, i.e., a lambda expression or a method in an anonymous or local
+   * class.
    *
-   * @param accessPath The access path that needs to be checked if filtered.
+   * @param path The tree path to the node for the nested method.
    * @param state The current visitor state.
-   * @return true if the nullability information for this accesspath should be treated as part of
-   *     the surrounding context when processing a lambda expression or anonymous class declaration.
+   * @return A predicate that determines which access paths should be preserved when analyzing the
+   *     nested method.
    */
-  boolean includeApInfoInSavedContext(AccessPath accessPath, VisitorState state);
+  default Predicate<AccessPath> getAccessPathPredicateForNestedMethod(
+      TreePath path, VisitorState state) {
+    return AccessPathPredicates.FALSE_AP_PREDICATE;
+  }
 
   /**
    * Called during dataflow analysis initialization to register structurally immutable types.
@@ -312,26 +418,218 @@ public interface Handler {
    *
    * @return A set of fully qualified immutable type names.
    */
-  ImmutableSet<String> onRegisterImmutableTypes();
+  default ImmutableSet<String> onRegisterImmutableTypes() {
+    return ImmutableSet.of();
+  }
 
   /**
-   * A three value enum for handlers implementing onDataflowVisitMethodInvocation to communicate
-   * their knowledge of the method return nullability to the the rest of NullAway.
+   * Called when a method writes a value to a {@code @NonNull} class field and the field accepts it:
+   * the value is non-null, or {@link com.uber.nullaway.Nullness#isNoChange()} holds for it and the
+   * field's type and declaration accept it.
+   *
+   * @param field Symbol of the initialized class field.
+   * @param analysis nullness dataflow analysis
+   * @param state VisitorState.
+   */
+  default void onNonNullFieldAssignment(
+      Symbol field, AccessPathNullnessAnalysis analysis, VisitorState state) {
+    // NoOp
+  }
+
+  /**
+   * Called during AST to CFG translation (CFGTranslationPhaseOne) immediately after translating a
+   * MethodInvocationTree.
+   *
+   * @param phase a reference to the NullAwayCFGTranslationPhaseOne object and its utility
+   *     functions.
+   * @param tree the MethodInvocationTree being translated.
+   * @param originalNode the resulting MethodInvocationNode right before this handler is called.
+   * @return a MethodInvocationNode which might be originalNode or a modified version, this is
+   *     passed to the next handler in the chain.
+   */
+  default MethodInvocationNode onCFGBuildPhase1AfterVisitMethodInvocation(
+      NullAwayCFGBuilder.NullAwayCFGTranslationPhaseOne phase,
+      MethodInvocationTree tree,
+      MethodInvocationNode originalNode) {
+    return originalNode;
+  }
+
+  /**
+   * Called to determine when a method acts as a cast-to-non-null operation on its parameters.
+   *
+   * <p>See {@link LibraryModels#castToNonNullMethods()} for more information about general
+   * configuration of <code>castToNonNull</code> methods.
+   *
+   * @param actualParams The actual parameters from the invocation node
+   * @param previousArgumentPosition The result computed by the previous handler in the chain, if
+   *     any.
+   * @return The index of the parameter for which the method should act as a cast (if any). This
+   *     value can be set only once through the full chain of handlers, with each handler deciding
+   *     whether to propagate or override the value previousArgumentPosition passed by the previous
+   *     handler in the chain.
+   * @param methodAnalysisContext The MethodAnalysisContext object
+   */
+  default @Nullable Integer castToNonNullArgumentPositionsForMethod(
+      List<? extends ExpressionTree> actualParams,
+      @Nullable Integer previousArgumentPosition,
+      MethodAnalysisContext methodAnalysisContext) {
+    // NoOp
+    return previousArgumentPosition;
+  }
+
+  /**
+   * Method to override the nullability of the upper bound for a generic type variable on a class.
+   *
+   * @param className name of the class
+   * @param index index of the generic type variable (starting at 0)
+   * @return boolean true if the variable should be treated as having a {@code @Nullable} upper
+   *     bound
+   */
+  default boolean onOverrideClassTypeVariableUpperBound(String className, int index) {
+    return false;
+  }
+
+  /**
+   * Method to override the nullability of the upper bound for a generic type variable on a method.
+   *
+   * @param methodSymbol The method symbol
+   * @param index index of the generic type variable (starting at 0)
+   * @param state The current visitor state.
+   * @return boolean true if the variable should be treated as having a {@code @Nullable} upper
+   *     bound
+   */
+  default boolean onOverrideMethodTypeVariableUpperBound(
+      Symbol.MethodSymbol methodSymbol, int index, VisitorState state) {
+    return false;
+  }
+
+  /**
+   * Method to override the null-markedness of a class.
+   *
+   * @param className name of the class
+   * @return boolean true if the class should be treated as {@code @NullMarked}
+   */
+  default boolean onOverrideNullMarkedClasses(String className) {
+    return false;
+  }
+
+  /**
+   * Updates whether a method should be treated as {@code @NullMarked}.
+   *
+   * <p>This hook supports method-level exceptions to null-markedness inherited from an enclosing
+   * class, including exceptions represented by library models.
+   *
+   * @param methodSymbol symbol for the method
+   * @param currentNullMarkedness null-markedness computed by the core and upstream handlers
+   * @return the possibly updated null-markedness
+   */
+  default boolean onOverrideMethodNullMarkedness(
+      Symbol.MethodSymbol methodSymbol, boolean currentNullMarkedness) {
+    return currentNullMarkedness;
+  }
+
+  /**
+   * Method to override the type of a method.
+   *
+   * @param methodSymbol symbol of the method
+   * @param methodType original method type
+   * @param state The current visitor state.
+   * @param invocationTree the invocation tree for the method, if available
+   * @return the possibly modified method type
+   */
+  default Type.MethodType onOverrideMethodType(
+      Symbol.MethodSymbol methodSymbol,
+      Type.MethodType methodType,
+      VisitorState state,
+      @Nullable MethodInvocationTree invocationTree) {
+    return methodType;
+  }
+
+  /**
+   * Returns modeled polymorphic-nullness locations for {@code methodSymbol}.
+   *
+   * <p>The generic type-checking machinery uses these locations when resolving an invocation. A
+   * handler should only provide model metadata here; substitution and call-site reasoning belong in
+   * {@code GenericsChecks}.
+   *
+   * <p>A non-empty result must include at least one location with a non-empty type path and must
+   * not contain receiver locations. {@link CompositeHandler} enforces these restrictions by
+   * throwing {@link IllegalArgumentException}. It also throws if multiple handlers return non-empty
+   * results for the same method, even if their location sets are identical.
+   */
+  default ImmutableSet<PolyNullLocation> onGetPolyNullLocations(
+      Symbol.MethodSymbol methodSymbol, VisitorState state) {
+    return ImmutableSet.of();
+  }
+
+  enum FieldSkipResult {
+    /** do not skip the check */
+    NO,
+
+    /** always skip the check */
+    YES,
+
+    /**
+     * Only skip the check for constructors with no arguments. If a constructor with arguments does
+     * not initialize the field, report a warning.
+     */
+    ONLY_FOR_ZERO_ARG_CONSTRUCTORS;
+
+    /** combine two {@link FieldSkipResult}s, preferring to skip more field checks */
+    public static FieldSkipResult combine(FieldSkipResult first, FieldSkipResult second) {
+      if (first == second) {
+        return first;
+      }
+      if (first == NO) {
+        return second;
+      }
+      if (second == NO) {
+        return first;
+      }
+      // one is YES and the other is ONLY_FOR_ZERO_ARG_CONSTRUCTORS; prefer YES
+      return YES;
+    }
+  }
+
+  /**
+   * Method to determine whether a field should be treated as initialized externally (e.g. by a
+   * framework), using the field and its enclosing class.
+   *
+   * @param classSymbol the symbol for the class declaring the field
+   * @param fieldSymbol the symbol for the field
+   * @param state visitor state
+   * @return a {@link FieldSkipResult} capturing when the check should be skipped
+   */
+  default FieldSkipResult shouldSkipFieldInitializationCheck(
+      Symbol.ClassSymbol classSymbol, Symbol fieldSymbol, VisitorState state) {
+    return FieldSkipResult.NO;
+  }
+
+  /**
+   * Returns true if the given method takes a single argument and returns {@code false} whenever the
+   * argument is {@code null}.
+   */
+  default boolean isSingleArgNullImpliesFalseMethod(
+      Symbol.MethodSymbol methodSymbol, VisitorState state) {
+    return false;
+  }
+
+  /**
+   * A handler's nullness hint for a field value, method-call result, or method-reference return.
+   * Hints from different handlers are combined using {@link #merge(NullnessHint)}.
    */
   public enum NullnessHint {
-    /**
-     * No new information about return nullability, defer to the core algorithm and other handlers.
-     */
+    /** Provides no new nullness information; defer to the core analysis and other handlers. */
     UNKNOWN(0, Nullness.NONNULL),
     /**
-     * The method is nullable in general (e.g. due to a library model or a return type annotation).
-     * Override core behavior and mark this method as Nullable, unless a handler returns
-     * FORCE_NONNULL.
+     * The value or return may be null. Requests nullable treatment unless another handler supplies
+     * {@link #FORCE_NONNULL}. During dataflow, known non-null facts can still refine this hint.
      */
     HINT_NULLABLE(1, Nullness.NULLABLE),
     /**
-     * Handler asserts this method is guaranteed to be NonNull for the current invocation (e.g. used
-     * by ContractHandler when all preconditions for a "-> !null" clause are known to hold).
+     * The value or return is guaranteed non-null in the analyzed context. Takes precedence over
+     * other handlers' hints. The core {@code Map.getOrDefault} rule replaces handler hints for
+     * calls and, in JSpecify mode, method references.
      */
     FORCE_NONNULL(2, Nullness.NONNULL);
 
@@ -347,6 +645,13 @@ public interface Handler {
       return nullness;
     }
 
+    /**
+     * Combines two hints by precedence: {@link #FORCE_NONNULL} over {@link #HINT_NULLABLE} over
+     * {@link #UNKNOWN}.
+     *
+     * @param other the hint to combine with this hint
+     * @return the higher-priority hint
+     */
     public NullnessHint merge(NullnessHint other) {
       if (other.priority > this.priority) {
         return other;

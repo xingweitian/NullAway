@@ -1,7 +1,7 @@
 package com.uber.nullaway.handlers.contract;
 
-import com.google.common.base.Function;
 import com.google.errorprone.VisitorState;
+import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.Tree;
 import com.sun.tools.javac.code.Symbol;
 import com.uber.nullaway.Config;
@@ -10,12 +10,14 @@ import com.uber.nullaway.NullAway;
 import com.uber.nullaway.NullabilityUtil;
 import java.util.Set;
 import java.util.stream.Collectors;
-import javax.annotation.Nullable;
 import javax.lang.model.element.AnnotationMirror;
 import org.checkerframework.nullaway.javacutil.AnnotationUtils;
+import org.jspecify.annotations.Nullable;
 
-/** An utility class for {@link ContractHandler} and {@link ContractCheckHandler}. */
+/** A utility class for {@link ContractHandler} and {@link ContractCheckHandler}. */
 public class ContractUtils {
+
+  private static final String[] EMPTY_STRING_ARRAY = new String[0];
 
   /**
    * Returns a set of field names excluding their receivers (e.g. "this.a" will be "a")
@@ -24,9 +26,8 @@ public class ContractUtils {
    * @return A set of trimmed field names.
    */
   public static Set<String> trimReceivers(Set<String> fieldNames) {
-    return fieldNames
-        .stream()
-        .map((Function<String, String>) input -> input.substring(input.lastIndexOf(".") + 1))
+    return fieldNames.stream()
+        .map(input -> input.substring(input.lastIndexOf(".") + 1))
         .collect(Collectors.toSet());
   }
 
@@ -45,20 +46,24 @@ public class ContractUtils {
 
     String[] parts = clause.split("->");
     if (parts.length != 2) {
-      String message =
-          "Invalid @Contract annotation detected for method "
-              + callee
-              + ". It contains the following uparseable clause: "
-              + clause
-              + "(see https://www.jetbrains.com/help/idea/contract-annotations.html).";
-      state.reportMatch(
-          analysis
-              .getErrorBuilder()
-              .createErrorDescription(
-                  new ErrorMessage(ErrorMessage.MessageTypes.ANNOTATION_VALUE_INVALID, message),
-                  tree,
-                  analysis.buildDescription(tree),
-                  state));
+      if (shouldReportInvalidContract(tree)) {
+        String message =
+            "Invalid @Contract annotation detected for method "
+                + callee
+                + ". It contains the following unparseable clause: "
+                + clause
+                + " (see https://www.jetbrains.com/help/idea/contract-annotations.html).";
+        state.reportMatch(
+            analysis
+                .getErrorBuilder()
+                .createErrorDescription(
+                    new ErrorMessage(ErrorMessage.MessageTypes.ANNOTATION_VALUE_INVALID, message),
+                    tree,
+                    analysis.buildDescription(tree),
+                    state,
+                    null));
+      }
+      return "";
     }
     return parts[1].trim();
   }
@@ -72,9 +77,10 @@ public class ContractUtils {
    * @param state The current visitor state.
    * @param callee Symbol for callee.
    * @param numOfArguments Number of arguments in the method associated with the contract.
-   * @return antecedents in the contract.
+   * @return antecedents in the contract, or {@code null} if their count does not match {@code
+   *     numOfArguments}
    */
-  static String[] getAntecedent(
+  static String @Nullable [] getAntecedent(
       String clause,
       Tree tree,
       NullAway analysis,
@@ -82,20 +88,18 @@ public class ContractUtils {
       Symbol callee,
       int numOfArguments) {
 
-    String[] parts = clause.split("->");
+    String[] antecedent = parseAntecedent(clause);
 
-    String[] antecedent = parts[0].split(",");
-
-    if (antecedent.length != numOfArguments) {
+    if (antecedent.length != numOfArguments && shouldReportInvalidContract(tree)) {
       String message =
           "Invalid @Contract annotation detected for method "
               + callee
-              + ". It contains the following uparseable clause: "
+              + ". It contains the following unparseable clause: "
               + clause
               + " (incorrect number of arguments in the clause's antecedent ["
               + antecedent.length
               + "], should be the same as the number of "
-              + "arguments in for the method ["
+              + "arguments for the method ["
               + numOfArguments
               + "]).";
       state.reportMatch(
@@ -105,9 +109,31 @@ public class ContractUtils {
                   new ErrorMessage(ErrorMessage.MessageTypes.ANNOTATION_VALUE_INVALID, message),
                   tree,
                   analysis.buildDescription(tree),
-                  state));
+                  state,
+                  null));
+    }
+    if (antecedent.length != numOfArguments) {
+      return null;
     }
     return antecedent;
+  }
+
+  /**
+   * Parses the antecedent portion of a contract clause into its component value constraints,
+   * without validating the count against a particular method's parameters (contrast with {@link
+   * #getAntecedent}, which performs that validation and reports an error on a given {@code Tree} if
+   * it fails).
+   *
+   * @param clause the contract clause
+   * @return the value constraints in the clause's antecedent, or an empty array if the antecedent
+   *     is empty (e.g. for a contract on a method with no arguments)
+   */
+  static String[] parseAntecedent(String clause) {
+    // Use the two-argument split passing -1 so that splitting "->" yields two empty parts.  Calling
+    // the single argument String.split on "->" yields an empty array, since it removes trailing
+    // empty strings from the result
+    String[] parts = clause.split("->", -1);
+    return parts[0].trim().isEmpty() ? new String[0] : parts[0].split(",");
   }
 
   /**
@@ -117,14 +143,53 @@ public class ContractUtils {
    * @param config the NullAway config
    * @return the value of a Contract annotation if present, or {@code null} if not present.
    */
-  @Nullable
-  static String getContractString(Symbol.MethodSymbol methodSymbol, Config config) {
+  static @Nullable String getContractString(Symbol.MethodSymbol methodSymbol, Config config) {
     for (AnnotationMirror annotation : methodSymbol.getAnnotationMirrors()) {
       String name = AnnotationUtils.annotationName(annotation);
-      if (config.isContractAnnotation(name)) {
+      if (hasSimpleNameContract(name) || config.isContractAnnotation(name)) {
         return NullabilityUtil.getAnnotationValue(methodSymbol, name);
       }
     }
     return null;
+  }
+
+  /**
+   * Checks if the input string, which is a qualified name, has simple name "Contract".
+   *
+   * @param input the qualified name to check
+   * @return true if the simple name is "Contract", false otherwise
+   */
+  private static boolean hasSimpleNameContract(String input) {
+    int lastDot = input.lastIndexOf('.');
+    String simpleName;
+    if (lastDot == -1) {
+      simpleName = input;
+    } else {
+      simpleName = input.substring(lastDot + 1);
+    }
+    return simpleName.equals("Contract");
+  }
+
+  static String[] getContractClauses(Symbol.MethodSymbol callee, Config config) {
+    // Check to see if this method has a @Contract annotation
+    String contractString = getContractString(callee, config);
+    if (contractString != null) {
+      String trimmedContractString = contractString.trim();
+      if (!trimmedContractString.isEmpty()) {
+        return trimmedContractString.split(";");
+      }
+    }
+    return EMPTY_STRING_ARRAY;
+  }
+
+  /**
+   * Determines whether we should report an invalid contract for the tree. Right now, we only report
+   * invalid contracts for method declarations ({@link MethodTree}s).
+   *
+   * @param tree the AST node to check
+   * @return true if we should report an invalid contract for this tree, false otherwise
+   */
+  private static boolean shouldReportInvalidContract(Tree tree) {
+    return tree instanceof MethodTree;
   }
 }

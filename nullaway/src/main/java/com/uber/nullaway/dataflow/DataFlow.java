@@ -18,10 +18,11 @@
 
 package com.uber.nullaway.dataflow;
 
+import static com.uber.nullaway.NullabilityUtil.castToNonNull;
 import static com.uber.nullaway.NullabilityUtil.findEnclosingMethodOrLambdaOrInitializer;
 
-import com.google.auto.value.AutoValue;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Verify;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
@@ -37,18 +38,20 @@ import com.sun.source.util.TreePath;
 import com.sun.tools.javac.processing.JavacProcessingEnvironment;
 import com.sun.tools.javac.util.Context;
 import com.uber.nullaway.NullabilityUtil;
-import javax.annotation.Nullable;
+import com.uber.nullaway.dataflow.cfg.NullAwayCFGBuilder;
+import com.uber.nullaway.generics.GenericsChecks;
+import com.uber.nullaway.handlers.Handler;
+import java.util.HashMap;
 import javax.annotation.processing.ProcessingEnvironment;
 import org.checkerframework.nullaway.dataflow.analysis.AbstractValue;
 import org.checkerframework.nullaway.dataflow.analysis.Analysis;
 import org.checkerframework.nullaway.dataflow.analysis.AnalysisResult;
-import org.checkerframework.nullaway.dataflow.analysis.ForwardAnalysisImpl;
 import org.checkerframework.nullaway.dataflow.analysis.ForwardTransferFunction;
 import org.checkerframework.nullaway.dataflow.analysis.Store;
 import org.checkerframework.nullaway.dataflow.analysis.TransferFunction;
 import org.checkerframework.nullaway.dataflow.cfg.ControlFlowGraph;
 import org.checkerframework.nullaway.dataflow.cfg.UnderlyingAST;
-import org.checkerframework.nullaway.dataflow.cfg.builder.CFGBuilder;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Provides a wrapper around {@link org.checkerframework.nullaway.dataflow.analysis.Analysis}.
@@ -69,24 +72,25 @@ public final class DataFlow {
 
   private final boolean assertsEnabled;
 
-  DataFlow(boolean assertsEnabled) {
+  private final Handler handler;
+
+  private final @Nullable GenericsChecks genericsChecks;
+
+  DataFlow(boolean assertsEnabled, Handler handler, @Nullable GenericsChecks genericsChecks) {
     this.assertsEnabled = assertsEnabled;
+    this.handler = handler;
+    this.genericsChecks = genericsChecks;
   }
 
-  private final LoadingCache<AnalysisParams, Analysis<?, ?, ?>> analysisCache =
+  private final LoadingCache<AnalysisParams, RunOnceForwardAnalysisImpl<?, ?, ?>> analysisCache =
       CacheBuilder.newBuilder()
           .maximumSize(MAX_CACHE_SIZE)
           .build(
-              new CacheLoader<AnalysisParams, Analysis<?, ?, ?>>() {
+              new CacheLoader<>() {
                 @Override
-                public Analysis<?, ?, ?> load(AnalysisParams key) {
-                  final ControlFlowGraph cfg = key.cfg();
-                  final ForwardTransferFunction<?, ?> transfer = key.transferFunction();
-
-                  @SuppressWarnings({"unchecked", "rawtypes"})
-                  final Analysis<?, ?, ?> analysis = new ForwardAnalysisImpl<>(transfer);
-                  analysis.performAnalysis(cfg);
-                  return analysis;
+                public RunOnceForwardAnalysisImpl<?, ?, ?> load(AnalysisParams key) {
+                  ForwardTransferFunction<?, ?> transfer = key.transferFunction();
+                  return new RunOnceForwardAnalysisImpl<>(transfer);
                 }
               });
 
@@ -94,24 +98,23 @@ public final class DataFlow {
       CacheBuilder.newBuilder()
           .maximumSize(MAX_CACHE_SIZE)
           .build(
-              new CacheLoader<CfgParams, ControlFlowGraph>() {
+              new CacheLoader<>() {
                 @Override
                 public ControlFlowGraph load(CfgParams key) {
-                  final TreePath codePath = key.codePath();
-                  final TreePath bodyPath;
-                  final UnderlyingAST ast;
-                  final ProcessingEnvironment env = key.environment();
-                  if (codePath.getLeaf() instanceof LambdaExpressionTree) {
-                    LambdaExpressionTree lambdaExpressionTree =
-                        (LambdaExpressionTree) codePath.getLeaf();
+                  TreePath codePath = key.codePath();
+                  TreePath bodyPath;
+                  UnderlyingAST ast;
+                  ProcessingEnvironment env = key.environment();
+                  if (codePath.getLeaf() instanceof LambdaExpressionTree lambdaExpressionTree) {
                     MethodTree enclMethod =
                         ASTHelpers.findEnclosingNode(codePath, MethodTree.class);
-                    ClassTree enclClass = ASTHelpers.findEnclosingNode(codePath, ClassTree.class);
+                    ClassTree enclClass =
+                        castToNonNull(ASTHelpers.findEnclosingNode(codePath, ClassTree.class));
                     ast = new UnderlyingAST.CFGLambda(lambdaExpressionTree, enclClass, enclMethod);
                     bodyPath = new TreePath(codePath, lambdaExpressionTree.getBody());
-                  } else if (codePath.getLeaf() instanceof MethodTree) {
-                    MethodTree method = (MethodTree) codePath.getLeaf();
-                    ClassTree enclClass = ASTHelpers.findEnclosingNode(codePath, ClassTree.class);
+                  } else if (codePath.getLeaf() instanceof MethodTree method) {
+                    ClassTree enclClass =
+                        castToNonNull(ASTHelpers.findEnclosingNode(codePath, ClassTree.class));
                     ast = new UnderlyingAST.CFGMethod(method, enclClass);
                     BlockTree body = method.getBody();
                     if (body == null) {
@@ -127,7 +130,8 @@ public final class DataFlow {
                     bodyPath = codePath;
                   }
 
-                  return CFGBuilder.build(bodyPath, ast, assertsEnabled, !assertsEnabled, env);
+                  return NullAwayCFGBuilder.build(
+                      bodyPath, ast, assertsEnabled, !assertsEnabled, env, handler, genericsChecks);
                 }
               });
 
@@ -139,16 +143,28 @@ public final class DataFlow {
    * their control flow graph is the same. - if two transfer functions are {@code equal}, and are
    * run over the same control flow graph, the analysis result is the same. - for all contexts, the
    * analysis result is the same.
+   *
+   * @param path path to method, lambda or initializer
+   * @param context Javac context
+   * @param transfer transfer functions
+   * @param performAnalysis whether dataflow analysis should be initiated via a call to {@code
+   *     performAnalysis}. If the analysis is already running, this parameter should be {@code
+   *     false}; dataflow cannot be run recursively.
    */
   private <A extends AbstractValue<A>, S extends Store<S>, T extends ForwardTransferFunction<A, S>>
-      Result<A, S, T> dataflow(TreePath path, Context context, T transfer) {
-    final ProcessingEnvironment env = JavacProcessingEnvironment.instance(context);
-    final ControlFlowGraph cfg = cfgCache.getUnchecked(CfgParams.create(path, env));
-    final AnalysisParams aparams = AnalysisParams.create(transfer, cfg);
+      Result<A, S, T> dataflow(
+          TreePath path, Context context, T transfer, boolean performAnalysis) {
+    ProcessingEnvironment env = JavacProcessingEnvironment.instance(context);
+    ControlFlowGraph cfg = cfgCache.getUnchecked(CfgParams.create(path, env));
+    AnalysisParams aparams = AnalysisParams.create(transfer, cfg);
     @SuppressWarnings("unchecked")
-    final Analysis<A, S, T> analysis = (Analysis<A, S, T>) analysisCache.getUnchecked(aparams);
+    RunOnceForwardAnalysisImpl<A, S, T> analysis =
+        (RunOnceForwardAnalysisImpl<A, S, T>) analysisCache.getUnchecked(aparams);
+    if (performAnalysis) {
+      analysis.performAnalysis(cfg);
+    }
 
-    return new Result<A, S, T>() {
+    return new Result<>() {
       @Override
       public Analysis<A, S, T> getAnalysis() {
         return analysis;
@@ -174,7 +190,12 @@ public final class DataFlow {
    */
   <A extends AbstractValue<A>, S extends Store<S>, T extends ForwardTransferFunction<A, S>>
       ControlFlowGraph getControlFlowGraph(TreePath path, Context context, T transfer) {
-    return dataflow(findEnclosingMethodOrLambdaOrInitializer(path), context, transfer)
+    TreePath enclosingMethodOrLambdaOrInitializer = findEnclosingMethodOrLambdaOrInitializer(path);
+    if (enclosingMethodOrLambdaOrInitializer == null) {
+      throw new IllegalArgumentException(
+          "Cannot get CFG for node outside a method, lambda, or initializer");
+    }
+    return dataflow(enclosingMethodOrLambdaOrInitializer, context, transfer, true)
         .getControlFlowGraph();
   }
 
@@ -185,16 +206,31 @@ public final class DataFlow {
    * @param exprPath expression
    * @param context Javac context
    * @param transfer transfer functions
+   * @param isRunning true if the dataflow analysis is currently running
    * @param <A> values in abstraction
    * @param <S> store type
    * @param <T> transfer function type
    * @return dataflow value for expression
    */
-  @Nullable
   public <A extends AbstractValue<A>, S extends Store<S>, T extends ForwardTransferFunction<A, S>>
-      A expressionDataflow(TreePath exprPath, Context context, T transfer) {
-    AnalysisResult<A, S> analysisResult = resultForExpr(exprPath, context, transfer);
-    return analysisResult == null ? null : analysisResult.getValue(exprPath.getLeaf());
+      @Nullable A expressionDataflow(
+          TreePath exprPath, Context context, T transfer, boolean isRunning) {
+    if (isRunning) {
+      // get the Analysis object from the cache, and get the current result from that
+      Analysis<A, S, T> analysis =
+          dataflow(
+                  Preconditions.checkNotNull(
+                      findEnclosingMethodOrLambdaOrInitializer(exprPath),
+                      "expression is not inside a method, lambda or initializer block!"),
+                  context,
+                  transfer,
+                  false)
+              .getAnalysis();
+      return analysis.getValue(exprPath.getLeaf());
+    } else {
+      AnalysisResult<A, S> analysisResult = resultForExpr(exprPath, context, transfer);
+      return analysisResult == null ? null : analysisResult.getValue(exprPath.getLeaf());
+    }
   }
 
   /**
@@ -209,8 +245,8 @@ public final class DataFlow {
    * @return dataflow result at exit of method
    */
   public <A extends AbstractValue<A>, S extends Store<S>, T extends ForwardTransferFunction<A, S>>
-      S finalResult(TreePath path, Context context, T transfer) {
-    final Tree leaf = path.getLeaf();
+      @Nullable S finalResult(TreePath path, Context context, T transfer) {
+    Tree leaf = path.getLeaf();
     Preconditions.checkArgument(
         leaf instanceof MethodTree
             || leaf instanceof LambdaExpressionTree
@@ -219,12 +255,11 @@ public final class DataFlow {
         "Leaf of methodPath must be of type MethodTree, LambdaExpressionTree, BlockTree, or VariableTree, but was %s",
         leaf.getClass().getName());
 
-    return dataflow(path, context, transfer).getAnalysis().getRegularExitStore();
+    return dataflow(path, context, transfer, true).getAnalysis().getRegularExitStore();
   }
 
-  @Nullable
   public <A extends AbstractValue<A>, S extends Store<S>, T extends ForwardTransferFunction<A, S>>
-      S resultBeforeExpr(TreePath exprPath, Context context, T transfer) {
+      @Nullable S resultBeforeExpr(TreePath exprPath, Context context, T transfer) {
     AnalysisResult<A, S> analysisResult = resultForExpr(exprPath, context, transfer);
     return analysisResult == null ? null : analysisResult.getStoreBefore(exprPath.getLeaf());
   }
@@ -234,17 +269,37 @@ public final class DataFlow {
    * Tree in a method. A bit riskier to use since we don't check that there is a corresponding CFG
    * node to the Tree; use with care.
    */
-  @Nullable
   public <A extends AbstractValue<A>, S extends Store<S>, T extends ForwardTransferFunction<A, S>>
-      S resultBefore(TreePath exprPath, Context context, T transfer) {
+      @Nullable S resultBefore(TreePath exprPath, Context context, T transfer) {
     AnalysisResult<A, S> analysisResult = resultFor(exprPath, context, transfer);
     return analysisResult == null ? null : analysisResult.getStoreBefore(exprPath.getLeaf());
   }
 
-  @Nullable
+  /**
+   * Like {@link #resultBefore(TreePath, Context, ForwardTransferFunction)} but for the case where
+   * the dataflow analysis is currently running
+   */
+  public <A extends AbstractValue<A>, S extends Store<S>, T extends ForwardTransferFunction<A, S>>
+      @Nullable S resultBeforeWithAnalysisRunning(TreePath exprPath, Context context, T transfer) {
+    TreePath enclosingPath = findEnclosingMethodOrLambdaOrInitializer(exprPath);
+    if (enclosingPath == null) {
+      throw new RuntimeException("expression is not inside a method, lambda or initializer block!");
+    }
+
+    Tree enclosing = enclosingPath.getLeaf();
+    if (enclosing instanceof MethodTree methodTree && methodTree.getBody() == null) {
+      return null;
+    }
+    RunOnceForwardAnalysisImpl<A, S, T> analysis =
+        (RunOnceForwardAnalysisImpl<A, S, T>)
+            dataflow(enclosingPath, context, transfer, false).getAnalysis();
+    Verify.verify(analysis.isRunning(), "Expected analysis to be running for %s", enclosing);
+    return analysis.getStoreBefore(exprPath.getLeaf(), new HashMap<>());
+  }
+
   <A extends AbstractValue<A>, S extends Store<S>, T extends ForwardTransferFunction<A, S>>
-      AnalysisResult<A, S> resultForExpr(TreePath exprPath, Context context, T transfer) {
-    final Tree leaf = exprPath.getLeaf();
+      @Nullable AnalysisResult<A, S> resultForExpr(TreePath exprPath, Context context, T transfer) {
+    Tree leaf = exprPath.getLeaf();
     Preconditions.checkArgument(
         leaf instanceof ExpressionTree,
         "Leaf of exprPath must be of type ExpressionTree, but was %s",
@@ -254,15 +309,14 @@ public final class DataFlow {
   }
 
   private <A extends AbstractValue<A>, S extends Store<S>, T extends ForwardTransferFunction<A, S>>
-      AnalysisResult<A, S> resultFor(TreePath exprPath, Context context, T transfer) {
-    final TreePath enclosingPath =
-        NullabilityUtil.findEnclosingMethodOrLambdaOrInitializer(exprPath);
+      @Nullable AnalysisResult<A, S> resultFor(TreePath exprPath, Context context, T transfer) {
+    TreePath enclosingPath = NullabilityUtil.findEnclosingMethodOrLambdaOrInitializer(exprPath);
     if (enclosingPath == null) {
       throw new RuntimeException("expression is not inside a method, lambda or initializer block!");
     }
 
-    final Tree method = enclosingPath.getLeaf();
-    if (method instanceof MethodTree && ((MethodTree) method).getBody() == null) {
+    Tree method = enclosingPath.getLeaf();
+    if (method instanceof MethodTree methodTree && methodTree.getBody() == null) {
       // expressions can occur in abstract methods, for example {@code Map.Entry} in:
       //
       //   abstract Set<Map.Entry<K, V>> entries();
@@ -273,7 +327,7 @@ public final class DataFlow {
     // *before* any unboxing operations (like invoking intValue() on an Integer).  This is
     // important,
     // e.g., for actually checking that the unboxing operation is legal.
-    return dataflow(enclosingPath, context, transfer).getAnalysis().getResult();
+    return dataflow(enclosingPath, context, transfer, true).getAnalysis().getResult();
   }
 
   /** clear the CFG and analysis caches */
@@ -282,36 +336,173 @@ public final class DataFlow {
     analysisCache.invalidateAll();
   }
 
-  @AutoValue
-  abstract static class CfgParams {
-    // Should not be used for hashCode or equals
-    private ProcessingEnvironment environment;
+  /**
+   * Check whether the dataflow analysis is currently running for the method, lambda or initializer
+   * which is the leaf of {@code path}.
+   *
+   * @param path path to method, lambda or initializer
+   * @param context Javac context
+   * @param transfer transfer functions
+   * @return true if the analysis is currently running for the given method, lambda or initializer
+   */
+  public boolean isRunning(TreePath path, Context context, AccessPathNullnessPropagation transfer) {
+    ProcessingEnvironment env = JavacProcessingEnvironment.instance(context);
+    ControlFlowGraph cfg = cfgCache.getUnchecked(CfgParams.create(path, env));
+    AnalysisParams aparams = AnalysisParams.create(transfer, cfg);
+    RunOnceForwardAnalysisImpl<?, ?, ?> analysis = analysisCache.getUnchecked(aparams);
+    return analysis.isRunning();
+  }
 
-    private static CfgParams create(TreePath codePath, ProcessingEnvironment environment) {
-      CfgParams cp = new AutoValue_DataFlow_CfgParams(codePath);
+  static final class CfgParams {
+
+    /**
+     * The {@link TreePath} representing the code location for which CFG-related parameters are
+     * being computed.
+     *
+     * <p>This field defines the logical identity of {@code CfgParams}. Equality, hash code
+     * computation, and string representation are all based solely on this field. See {@link
+     * #equals(Object)} for how paths are compared.
+     */
+    private final TreePath codePath;
+
+    /**
+     * The {@link ProcessingEnvironment} associated with the current analysis.
+     *
+     * <p>This field is intentionally <em>not</em> final and is excluded from {@link
+     * #equals(Object)} and {@link #hashCode()} because:
+     *
+     * <ul>
+     *   <li>It is injected after construction
+     *   <li>It is mutable
+     *   <li>It does not contribute to logical identity
+     * </ul>
+     */
+    private @Nullable ProcessingEnvironment environment;
+
+    /**
+     * Private constructor used internally to enforce controlled creation via {@link
+     * #create(TreePath, ProcessingEnvironment)}.
+     *
+     * @param codePath the {@link TreePath} identifying the analyzed code location
+     */
+    private CfgParams(TreePath codePath) {
+      this.codePath = codePath;
+    }
+
+    /**
+     * Creates a new {@code CfgParams} instance.
+     *
+     * <p>The {@link ProcessingEnvironment} is assigned after construction to preserve immutability
+     * of the identity-defining fields while still allowing environment injection.
+     *
+     * @param codePath the {@link TreePath} identifying the analyzed code location
+     * @param environment the {@link ProcessingEnvironment} for the current annotation processing
+     *     round
+     * @return a fully initialized {@code CfgParams} instance
+     */
+    static CfgParams create(TreePath codePath, ProcessingEnvironment environment) {
+      CfgParams cp = new CfgParams(codePath);
       cp.environment = environment;
       return cp;
     }
 
+    /**
+     * Returns the {@link ProcessingEnvironment} associated with this instance.
+     *
+     * <p>This method guarantees a non-null return value. It is an error to call this method before
+     * the environment has been set via {@link #create}.
+     *
+     * @return the non-null {@link ProcessingEnvironment}
+     */
     ProcessingEnvironment environment() {
-      return environment;
+      return castToNonNull(environment);
     }
 
-    abstract TreePath codePath();
+    /**
+     * Returns the {@link TreePath} that defines the identity of this instance.
+     *
+     * @return the {@link TreePath} associated with this configuration
+     */
+    TreePath codePath() {
+      return codePath;
+    }
+
+    /**
+     * Indicates whether some other object is equal to this one.
+     *
+     * <p>Equality is based solely on {@link #codePath}. The {@link ProcessingEnvironment} is
+     * intentionally excluded.
+     *
+     * <p>{@link TreePath} does not override {@link Object#equals(Object)}. The field initialization
+     * checks create new {@link TreePath} instances for constructors and initializers, and the
+     * scanner later visits the same code with different instances. Comparing those paths by
+     * identity would cause the CFG and dataflow analysis for each constructor and initializer to be
+     * computed twice. So, for constructors and initializers, two instances are equal if their paths
+     * have the same leaf.
+     *
+     * <p>Other code (e.g., lambdas and methods of anonymous classes) is still compared by path
+     * identity, since its analysis results can depend on facts recorded by handlers while analyzing
+     * other code (e.g., a {@code filter()} predicate preceding a {@code map()} function in a stream
+     * chain), and so must not be reused across paths.
+     *
+     * @param o the reference object with which to compare
+     * @return {@code true} if this object is equal to the given object; {@code false} otherwise
+     */
+    @Override
+    public boolean equals(@Nullable Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (!(o instanceof CfgParams that)) {
+        return false;
+      }
+      Tree leaf = this.codePath.getLeaf();
+      if (isConstructorOrInitializer(leaf)) {
+        return leaf == that.codePath.getLeaf();
+      }
+      return this.codePath.equals(that.codePath);
+    }
+
+    /**
+     * Returns a hash code value for this object.
+     *
+     * <p>The hash code is computed solely from the leaf of {@link #codePath} to remain consistent
+     * with {@link #equals(Object)}.
+     *
+     * @return a hash code value for this object
+     */
+    @Override
+    public int hashCode() {
+      return System.identityHashCode(codePath.getLeaf());
+    }
+
+    private static boolean isConstructorOrInitializer(Tree tree) {
+      return (tree instanceof MethodTree methodTree
+              && ASTHelpers.getSymbol(methodTree).isConstructor())
+          || tree instanceof BlockTree
+          || tree instanceof VariableTree;
+    }
+
+    /**
+     * Returns a string representation of this object.
+     *
+     * <p>The returned string includes only the identity-defining fields and omits the {@link
+     * ProcessingEnvironment} to keep the output stable and readable.
+     *
+     * @return a string representation of this {@code CfgParams}
+     */
+    @Override
+    public String toString() {
+      return "CfgParams{codePath=" + codePath + "}";
+    }
   }
 
-  @AutoValue
-  abstract static class AnalysisParams {
+  record AnalysisParams(ForwardTransferFunction<?, ?> transferFunction, ControlFlowGraph cfg) {
 
     private static AnalysisParams create(
         ForwardTransferFunction<?, ?> transferFunction, ControlFlowGraph cfg) {
-      AnalysisParams ap = new AutoValue_DataFlow_AnalysisParams(transferFunction, cfg);
-      return ap;
+      return new AnalysisParams(transferFunction, cfg);
     }
-
-    abstract ForwardTransferFunction<?, ?> transferFunction();
-
-    abstract ControlFlowGraph cfg();
   }
 
   /** A pair of Analysis and ControlFlowGraph. */

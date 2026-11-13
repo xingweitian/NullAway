@@ -1,0 +1,84 @@
+/*
+ * Copyright (C) 2022. Uber Technologies
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+plugins {
+    id 'java-library'
+    id 'nullaway.java-test-conventions'
+}
+
+configurations {
+    // A configuration holding the jars for the oldest supported version of Error Prone, to use with tests
+    errorProneOldest
+}
+
+// We need this separate build target to test newer versions of Guava
+// (e.g. 31+) than that which NullAway currently depends on.
+
+dependencies {
+    testImplementation project(":nullaway")
+    testImplementation libs.junit4
+    testImplementation(libs.error.prone.test.helpers) {
+        exclude group: "junit", module: "junit"
+    }
+    testImplementation libs.jsr305
+    testImplementation libs.guava.latest
+
+    errorProneOldest "com.google.errorprone:error_prone_check_api:${oldestErrorProneVersion}"
+    errorProneOldest("com.google.errorprone:error_prone_test_helpers:${oldestErrorProneVersion}") {
+        exclude group: "junit", module: "junit"
+    }
+    errorProneOldest libs.guava.latest
+
+    errorProneJdk17 libs.guava.latest
+}
+
+// Create a task to test with the oldest supported version of Error Prone
+// (while still building against the latest supported version)
+def epOldestTest = tasks.register("testErrorProneOldest", Test) {
+
+    javaLauncher = javaToolchains.launcherFor {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+
+    description = "Runs the test suite using the oldest supported version of Error Prone"
+    group = LifecycleBasePlugin.VERIFICATION_GROUP
+
+    // Copy inputs from normal Test task.
+    def testTask = tasks.getByName("test")
+    // A bit of a hack: we add the dependencies of the oldest supported Error Prone version to the _beginning_ of the
+    // classpath, so that they are used instead of the latest version.  This exercises the scenario of building
+    // NullAway against the latest supported Error Prone version but then running on the oldest supported version.
+    classpath = configurations.errorProneOldest + testTask.classpath
+    testClassesDirs = testTask.testClassesDirs
+
+    jvmArgs += [
+        "--add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.main=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.model=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.processing=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED",
+        "--add-opens=jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED",
+        "--add-opens=jdk.compiler/com.sun.tools.javac.comp=ALL-UNNAMED",
+        // Accessed by Lombok tests
+        "--add-opens=jdk.compiler/com.sun.tools.javac.jvm=ALL-UNNAMED",
+    ]
+}
+
+tasks.named('check').configure {
+    dependsOn(epOldestTest)
+}

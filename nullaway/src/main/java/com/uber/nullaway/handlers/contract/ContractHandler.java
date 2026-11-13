@@ -22,25 +22,40 @@
 
 package com.uber.nullaway.handlers.contract;
 
+import static com.uber.nullaway.NullabilityUtil.castToNonNull;
 import static com.uber.nullaway.handlers.contract.ContractUtils.getAntecedent;
 import static com.uber.nullaway.handlers.contract.ContractUtils.getConsequent;
 
 import com.google.common.base.Preconditions;
 import com.google.errorprone.VisitorState;
 import com.google.errorprone.util.ASTHelpers;
-import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.CompilationUnitTree;
+import com.sun.source.tree.ExpressionTree;
+import com.sun.source.tree.MemberReferenceTree;
+import com.sun.source.tree.MethodInvocationTree;
 import com.sun.tools.javac.code.Symbol;
-import com.sun.tools.javac.code.Types;
-import com.sun.tools.javac.util.Context;
+import com.sun.tools.javac.code.Type;
 import com.uber.nullaway.Config;
-import com.uber.nullaway.ErrorMessage;
 import com.uber.nullaway.NullAway;
+import com.uber.nullaway.NullabilityUtil;
 import com.uber.nullaway.Nullness;
 import com.uber.nullaway.dataflow.AccessPath;
 import com.uber.nullaway.dataflow.AccessPathNullnessPropagation;
-import com.uber.nullaway.handlers.BaseNoOpHandler;
-import javax.annotation.Nullable;
+import com.uber.nullaway.dataflow.cfg.NullAwayCFGBuilder;
+import com.uber.nullaway.generics.GenericsChecks;
+import com.uber.nullaway.handlers.Handler;
+import com.uber.nullaway.handlers.MethodAnalysisContext;
+import java.util.Optional;
+import javax.lang.model.type.TypeMirror;
+import org.checkerframework.nullaway.dataflow.cfg.node.AbstractNodeVisitor;
+import org.checkerframework.nullaway.dataflow.cfg.node.BinaryOperationNode;
+import org.checkerframework.nullaway.dataflow.cfg.node.ConditionalNotNode;
+import org.checkerframework.nullaway.dataflow.cfg.node.EqualToNode;
 import org.checkerframework.nullaway.dataflow.cfg.node.MethodInvocationNode;
+import org.checkerframework.nullaway.dataflow.cfg.node.Node;
+import org.checkerframework.nullaway.dataflow.cfg.node.NotEqualNode;
+import org.checkerframework.nullaway.dataflow.cfg.node.TypeCastNode;
+import org.jspecify.annotations.Nullable;
 
 /**
  * This Handler parses the jetbrains @Contract annotation and honors the nullness spec defined there
@@ -73,139 +88,454 @@ import org.checkerframework.nullaway.dataflow.cfg.node.MethodInvocationNode;
  * clause is given in terms of many. This is not behavior that should be counted on, but it is
  * sound.
  */
-public class ContractHandler extends BaseNoOpHandler {
+public class ContractHandler implements Handler {
 
   private final Config config;
 
   private @Nullable NullAway analysis;
-  private @Nullable VisitorState state;
+
+  // Cached on visiting the compilation unit and used for
+  // onCFGBuildPhase1AfterVisitMethodInvocation, where no VisitorState is otherwise available.
+  private @Nullable VisitorState storedVisitorState;
+
+  private @Nullable TypeMirror runtimeExceptionType;
 
   public ContractHandler(Config config) {
     this.config = config;
   }
 
   @Override
-  public void onMatchTopLevelClass(
-      NullAway analysis, ClassTree tree, VisitorState state, Symbol.ClassSymbol classSymbol) {
+  public boolean isSingleArgNullImpliesFalseMethod(
+      Symbol.MethodSymbol methodSymbol, VisitorState state) {
+    if (methodSymbol.getParameters().size() != 1) {
+      return false;
+    }
+    for (String clause : ContractUtils.getContractClauses(methodSymbol, config)) {
+      String[] parts = clause.split("->");
+      if (parts.length != 2) {
+        continue;
+      }
+      String[] antecedent = parts[0].trim().isEmpty() ? new String[0] : parts[0].split(",");
+      if (antecedent.length == 1
+          && antecedent[0].trim().equals("null")
+          && parts[1].trim().equals("false")) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * If the referenced method has a {@code @Contract} clause guaranteeing a non-null return value
+   * for the arguments that the functional interface method is going to pass, then the method
+   * reference is a valid implementation of that interface, even though the referenced method is
+   * declared {@code @Nullable}. We record that fact as computed nullness, so that the check in
+   * {@code NullAway#checkOverriding} does not report a spurious {@code WRONG_OVERRIDE_RETURN}
+   * error.
+   *
+   * <p>E.g., a method with the contract {@code "null -> null; !null -> !null"} can be referenced
+   * where a {@code Function<String, String>} is expected in {@code @NullMarked} code, since that
+   * interface never passes null.
+   */
+  @Override
+  public void onMatchMethodReference(
+      MemberReferenceTree tree, MethodAnalysisContext methodAnalysisContext) {
+    Symbol.MethodSymbol referencedMethod = methodAnalysisContext.methodSymbol();
+    String[] clauses = ContractUtils.getContractClauses(referencedMethod, config);
+    if (clauses.length == 0) {
+      return;
+    }
+    NullAway analysis = methodAnalysisContext.analysis();
+    VisitorState state = methodAnalysisContext.state();
+    Symbol.MethodSymbol funcInterfaceMethod =
+        NullabilityUtil.getFunctionalInterfaceMethod(tree, state.getTypes());
+    int numParams = referencedMethod.getParameters().size();
+    // We only reason about references whose parameters line up one-to-one with the parameters of
+    // the functional interface method. In particular, this bails out on unbound references, where
+    // the first parameter of the interface method becomes the receiver, and on varargs.
+    if (referencedMethod.isVarArgs()
+        || funcInterfaceMethod.isVarArgs()
+        || funcInterfaceMethod.getParameters().size() != numParams) {
+      return;
+    }
+    for (String clause : clauses) {
+      String[] parts = clause.split("->");
+      if (parts.length != 2 || !parts[1].trim().equals("!null")) {
+        continue;
+      }
+      String[] antecedent = parts[0].trim().isEmpty() ? new String[0] : parts[0].split(",");
+      if (antecedent.length != numParams) {
+        continue;
+      }
+      boolean guaranteedNonNull = true;
+      for (int i = 0; i < antecedent.length; i++) {
+        String valueConstraint = antecedent[i].trim();
+        if (valueConstraint.equals("_")) {
+          // the clause holds no matter what is passed at this position
+          continue;
+        }
+        if (!valueConstraint.equals("!null")
+            || !funcInterfaceParamIsNonNull(tree, funcInterfaceMethod, i, analysis, state)) {
+          guaranteedNonNull = false;
+          break;
+        }
+      }
+      if (guaranteedNonNull) {
+        analysis.setComputedNullness(tree, Nullness.NONNULL);
+        return;
+      }
+    }
+  }
+
+  /**
+   * Checks whether the functional interface method is guaranteed to pass a non-null value at the
+   * given parameter position. The logic mirrors how {@code NullAway#checkParamOverriding} computes
+   * the nullness of the parameters of the overridden method for a method reference.
+   *
+   * @param tree the method reference
+   * @param funcInterfaceMethod the method of the functional interface being implemented
+   * @param paramIndex index of the parameter
+   * @param analysis a reference to the running NullAway analysis
+   * @param state the visitor state
+   * @return true if the parameter at {@code paramIndex} is known to be non-null
+   */
+  private boolean funcInterfaceParamIsNonNull(
+      MemberReferenceTree tree,
+      Symbol.MethodSymbol funcInterfaceMethod,
+      int paramIndex,
+      NullAway analysis,
+      VisitorState state) {
+    if (Nullness.paramHasNullableAnnotation(funcInterfaceMethod, paramIndex, config)) {
+      return false;
+    }
+    if (config.isJSpecifyMode()) {
+      // The parameter type may be a type variable instantiated with a @Nullable type argument at
+      // this use site, e.g. Function<@Nullable String, String>; ask GenericsChecks about it.
+      GenericsChecks genericsChecks = analysis.getGenericsChecks();
+      Type functionalInterfaceType = genericsChecks.getPolyExpressionType(tree);
+      return genericsChecks
+          .getGenericMethodParameterNullness(
+              paramIndex, funcInterfaceMethod, functionalInterfaceType, state)
+          .equals(Nullness.NONNULL);
+    }
+    return true;
+  }
+
+  @Override
+  public void onMatchCompilationUnit(
+      NullAway analysis, CompilationUnitTree tree, VisitorState state) {
     this.analysis = analysis;
-    this.state = state;
+    this.storedVisitorState = state;
+  }
+
+  @Override
+  public MethodInvocationNode onCFGBuildPhase1AfterVisitMethodInvocation(
+      NullAwayCFGBuilder.NullAwayCFGTranslationPhaseOne phase,
+      MethodInvocationTree tree,
+      MethodInvocationNode originalNode) {
+    Preconditions.checkNotNull(storedVisitorState);
+    Preconditions.checkNotNull(analysis);
+    Symbol.MethodSymbol callee = ASTHelpers.getSymbol(tree);
+    Preconditions.checkNotNull(callee);
+    for (String clause : ContractUtils.getContractClauses(callee, config)) {
+      // This method currently handles contracts of the form `(true|false) -> fail`, other
+      // contracts are handled by 'onDataflowVisitMethodInvocation' which has access to more
+      // dataflow information.
+      if (!"fail".equals(getConsequent(clause, tree, analysis, storedVisitorState, callee))) {
+        continue;
+      }
+      String[] antecedent =
+          getAntecedent(
+              clause,
+              tree,
+              analysis,
+              storedVisitorState,
+              callee,
+              originalNode.getArguments().size());
+      if (antecedent == null) {
+        continue;
+      }
+      // Find a single value constraint that is not already known. If more than one argument with
+      // unknown nullness affects the method's result, then ignore this clause.
+      Node arg = null;
+      // Set to false if the rule is detected to be one we don't yet support
+      boolean supported = true;
+      boolean booleanConstraint = false;
+
+      for (int i = 0; i < antecedent.length; ++i) {
+        String valueConstraint = antecedent[i].trim();
+        if ("false".equals(valueConstraint) || "true".equals(valueConstraint)) {
+          if (arg != null) {
+            // We don't currently support contracts depending on the boolean value of more than one
+            // argument using the node-insertion method.
+            supported = false;
+            break;
+          }
+          booleanConstraint = Boolean.parseBoolean(valueConstraint);
+          arg = originalNode.getArgument(i);
+        } else if (!valueConstraint.equals("_")) {
+          // Found an unsupported type of constraint, only true, false, and '_' (wildcard) are
+          // supported.
+          // No need to implement complex handling here, 'onDataflowVisitMethodInvocation' will
+          // validate the contract.
+          supported = false;
+          break;
+        }
+      }
+      if (supported) {
+        // In practice the failure may not be RuntimeException, however the
+        // throw is inserted after the method invocation where we must assume that
+        // any invocation is capable of throwing an unchecked throwable.
+        if (runtimeExceptionType == null) {
+          runtimeExceptionType = phase.classToErrorType(RuntimeException.class);
+        }
+        Preconditions.checkNotNull(runtimeExceptionType);
+        // If arg != null, we found a single boolean antecedent that determines whether the call
+        // fails, as reflected by booleanConstraint.  Otherwise, all antecedents are '_' (or there
+        // are no antecedents), meaning the method fails unconditionally
+        if (arg != null) {
+          if (booleanConstraint) {
+            phase.insertThrowOnTrue(arg, runtimeExceptionType);
+          } else {
+            phase.insertThrowOnFalse(arg, runtimeExceptionType);
+          }
+        } else {
+          phase.insertUnconditionalThrow(runtimeExceptionType);
+        }
+      }
+    }
+    return originalNode;
   }
 
   @Override
   public NullnessHint onDataflowVisitMethodInvocation(
       MethodInvocationNode node,
-      Types types,
-      Context context,
+      Symbol.MethodSymbol callee,
+      VisitorState state,
       AccessPath.AccessPathContext apContext,
       AccessPathNullnessPropagation.SubNodeValues inputs,
       AccessPathNullnessPropagation.Updates thenUpdates,
       AccessPathNullnessPropagation.Updates elseUpdates,
       AccessPathNullnessPropagation.Updates bothUpdates) {
-    Symbol.MethodSymbol callee = ASTHelpers.getSymbol(node.getTree());
-    Preconditions.checkNotNull(callee);
-    // Check to see if this method has an @Contract annotation
-    String contractString = ContractUtils.getContractString(callee, config);
-    if (contractString != null && contractString.trim().length() > 0) {
-      // Found a contract, lets parse it.
-      String[] clauses = contractString.split(";");
-      for (String clause : clauses) {
+    Preconditions.checkNotNull(analysis);
+    MethodInvocationTree tree = castToNonNull(node.getTree());
+    for (String clause : ContractUtils.getContractClauses(callee, config)) {
 
-        String[] antecedent =
-            getAntecedent(
-                clause, node.getTree(), analysis, state, callee, node.getArguments().size());
-        String consequent = getConsequent(clause, node.getTree(), analysis, state, callee);
+      String[] antecedent =
+          getAntecedent(clause, tree, analysis, state, callee, node.getArguments().size());
+      if (antecedent == null) {
+        continue;
+      }
+      String consequent = getConsequent(clause, tree, analysis, state, callee);
 
-        // Find a single value constraint that is not already known. If more than one arguments with
-        // unknown
-        // nullness affect the method's result, then ignore this clause.
-        int argIdx = -1;
-        Nullness argAntecedentNullness = null;
-        boolean supported =
-            true; // Set to false if the rule is detected to be one we don't yet support
+      // Find a single value constraint that is not already known. If more than one argument with
+      // unknown nullness affects the method's result, then ignore this clause.
+      Node arg = null;
+      Nullness argAntecedentNullness = null;
+      // Set to false if the rule is detected to be one we don't yet support
+      boolean supported = true;
 
-        for (int i = 0; i < antecedent.length; ++i) {
-          String valueConstraint = antecedent[i].trim();
-          if (valueConstraint.equals("_")) {
-            continue;
-          } else if (valueConstraint.equals("false") || valueConstraint.equals("true")) {
-            supported = false;
-            break;
-          } else if (valueConstraint.equals("!null")
-              && inputs.valueOfSubNode(node.getArgument(i)).equals(Nullness.NONNULL)) {
-            // We already know this argument can't be null, so we can treat it as not part of the
-            // clause
-            // for the purpose of deciding the non-nullness of the other arguments.
-            continue;
-          } else if (valueConstraint.equals("null") || valueConstraint.equals("!null")) {
-            if (argIdx != -1) {
-              // More than one argument involved in the antecedent, ignore this rule
-              supported = false;
-              break;
+      for (int i = 0; i < antecedent.length; ++i) {
+        String valueConstraint = antecedent[i].trim();
+        if (valueConstraint.equals("_")) {
+          // do nothing
+        } else if (valueConstraint.equals("false") || valueConstraint.equals("true")) {
+          ExpressionTree argumentTree = tree.getArguments().get(i);
+          Object constValue = ASTHelpers.constValue(argumentTree);
+          if (constValue instanceof Boolean booleanValue) {
+            boolean booleanConstraintValue = valueConstraint.equals("true");
+            if (booleanValue == booleanConstraintValue) {
+              // Antecedent is satisfied by a compile-time boolean constant
+              continue;
             }
-            argIdx = i;
-            argAntecedentNullness =
-                valueConstraint.equals("null") ? Nullness.NULLABLE : Nullness.NONNULL;
-          } else {
-            Preconditions.checkNotNull(state);
-            Preconditions.checkNotNull(analysis);
-            String errorMessage =
-                "Invalid @Contract annotation detected for method "
-                    + callee
-                    + ". It contains the following uparseable clause: "
-                    + clause
-                    + " (unknown value constraint: "
-                    + valueConstraint
-                    + ", see https://www.jetbrains.com/help/idea/contract-annotations.html).";
-            state.reportMatch(
-                analysis
-                    .getErrorBuilder()
-                    .createErrorDescription(
-                        new ErrorMessage(
-                            ErrorMessage.MessageTypes.ANNOTATION_VALUE_INVALID, errorMessage),
-                        node.getTree(),
-                        analysis.buildDescription(node.getTree()),
-                        state));
+            // constant passed is opposite of antecedent
             supported = false;
             break;
           }
-        }
-        if (!supported) {
-          // Too many arguments involved, or unsupported @Contract features. On to next clause in
-          // the
-          // contract expression
-          continue;
-        }
-        if (argIdx == -1) {
-          // The antecedent is unconditionally true. Check for the ... -> !null case and set the
-          // return nullness accordingly
-          if (consequent.equals("!null")) {
-            return NullnessHint.FORCE_NONNULL;
+          // We handle boolean constraints in the case that the boolean argument is the result
+          // of a null or not-null check. For example,
+          // '@Contract("true -> true") boolean func(boolean v)'
+          // called with 'func(obj == null)'
+          // can be interpreted as equivalent to
+          // '@Contract("null -> true") boolean func(@Nullable Object v)'
+          // called with 'func(obj)'
+          // This path unwraps null reference equality and inequality checks
+          // to pass the target (in the above example, 'obj') as arg.
+          Node argument = node.getArgument(i);
+          // isNullTarget is the variable side of a null check. For example, 'e == null',
+          // 'null == e', and '!(e != null)' all return the node representing 'e'.
+          Optional<Node> isNullTarget = argument.accept(NullEqualityVisitor.IS_NULL, inputs);
+          // notNullTarget is the variable side of a not-null check. For example, 'e != null',
+          // 'null != e', and '!(e == null)' all return the node representing 'e'.
+          Optional<Node> notNullTarget = argument.accept(NullEqualityVisitor.NOT_NULL, inputs);
+          // It is possible for at most one of isNullTarget and notNullTarget to be present.
+          Node nullTestTarget = isNullTarget.orElse(notNullTarget.orElse(null));
+          if (nullTestTarget == null) {
+            supported = false;
+            break;
           }
-          continue;
+          // isNullTarget is equivalent to 'null ->' while notNullTarget is equivalent
+          // to '!null ->'. However, the valueConstraint may reverse the check.
+          // The following table illustrates expected antecedentNullness based on
+          // null comparison direction and constraint:
+          //                    | (obj == null)   | (obj != null)
+          // Constraint 'true'  | NULL            | NONNULL
+          // Constraint 'false' | NONNULL         | NULL
+          boolean booleanConstraintValue = valueConstraint.equals("true");
+          Nullness antecedentNullness =
+              isNullTarget.isPresent()
+                  ? (booleanConstraintValue ? Nullness.NULL : Nullness.NONNULL)
+                  :
+                  // !isNullTarget.isPresent()  -> notNullTarget.present() must be true
+                  (booleanConstraintValue ? Nullness.NONNULL : Nullness.NULL);
+          Nullness targetNullness = inputs.valueOfSubNode(nullTestTarget);
+          boolean satisfied =
+              antecedentNullness == Nullness.NULL
+                  ? targetNullness.isNull()
+                  : targetNullness == Nullness.NONNULL;
+          if (satisfied) {
+            // We already know this argument is satisfied so we can treat it as part of the
+            // clause for the purpose of deciding the nullness of the other arguments.
+            continue;
+          }
+          if (arg != null) {
+            // More than one argument involved in the antecedent, ignore this rule
+            supported = false;
+            break;
+          }
+          arg = nullTestTarget;
+          argAntecedentNullness = antecedentNullness;
+        } else if (valueConstraint.equals("!null")
+            && inputs.valueOfSubNode(node.getArgument(i)).equals(Nullness.NONNULL)) {
+          // We already know this argument can't be null, so we can treat it as not part of the
+          // clause for the purpose of deciding the non-nullness of the other arguments; do nothing
+        } else if (valueConstraint.equals("null") || valueConstraint.equals("!null")) {
+          if (arg != null) {
+            // More than one argument involved in the antecedent, ignore this rule
+            supported = false;
+            break;
+          }
+          arg = node.getArgument(i);
+          argAntecedentNullness = valueConstraint.equals("null") ? Nullness.NULL : Nullness.NONNULL;
+        } else {
+          // invalid, but we report an error only on method declarations
+          supported = false;
+          break;
         }
-        assert argAntecedentNullness != null;
-        // The nullness of one argument is all that matters for the antecedent, let's negate the
-        // consequent to fix the nullness of this argument.
-        AccessPath accessPath =
-            AccessPath.getAccessPathForNodeNoMapGet(node.getArgument(argIdx), apContext);
-        if (accessPath == null) {
-          continue;
+      }
+      if (!supported) {
+        // Too many arguments involved, or unsupported @Contract features. On to next clause in the
+        // contract expression
+        continue;
+      }
+      if (arg == null) {
+        // The antecedent is unconditionally true. Check for the ... -> !null case and set the
+        // return nullness accordingly
+        if (consequent.equals("!null")) {
+          return NullnessHint.FORCE_NONNULL;
         }
-        if (consequent.equals("false") && argAntecedentNullness.equals(Nullness.NULLABLE)) {
-          // If argIdx being null implies the return of the method being false, then the return
-          // being true implies argIdx is not null and we must mark it as such in the then update.
-          thenUpdates.set(accessPath, Nullness.NONNULL);
-        } else if (consequent.equals("true") && argAntecedentNullness.equals(Nullness.NULLABLE)) {
-          // If argIdx being null implies the return of the method being true, then the return being
-          // false implies argIdx is not null and we must mark it as such in the else update.
-          elseUpdates.set(accessPath, Nullness.NONNULL);
-        } else if (consequent.equals("fail") && argAntecedentNullness.equals(Nullness.NULLABLE)) {
-          // If argIdx being null implies the method throws an exception, then we can mark it as
-          // non-null on both non-exceptional exits from the method
-          bothUpdates.set(accessPath, Nullness.NONNULL);
-        }
+        continue;
+      }
+      Preconditions.checkState(
+          argAntecedentNullness != null, "argAntecedentNullness should have been set");
+      // The nullness of one argument is all that matters for the antecedent, let's negate the
+      // consequent to fix the nullness of this argument.
+      AccessPath accessPath = AccessPath.getAccessPathForNode(arg, state, apContext);
+      if (accessPath == null) {
+        continue;
+      }
+      if (consequent.equals("false") && argAntecedentNullness.equals(Nullness.NULL)) {
+        // If arg being null implies the return of the method being false, then the return
+        // being true implies arg is not null and we must mark it as such in the then update.
+        thenUpdates.set(accessPath, Nullness.NONNULL);
+      } else if (consequent.equals("true") && argAntecedentNullness.equals(Nullness.NULL)) {
+        // If arg being null implies the return of the method being true, then the return being
+        // false implies arg is not null and we must mark it as such in the else update.
+        elseUpdates.set(accessPath, Nullness.NONNULL);
+      } else if (consequent.equals("fail") && argAntecedentNullness.equals(Nullness.NULL)) {
+        // If arg being null implies the method throws an exception, then we can mark it as
+        // non-null on both non-exceptional exits from the method
+        bothUpdates.set(accessPath, Nullness.NONNULL);
       }
     }
     return NullnessHint.UNKNOWN;
+  }
+
+  /**
+   * This visitor returns an {@link Optional<Node>} representing the non-null side of a null
+   * comparison check.
+   *
+   * <p>The visitor matches an {@link EqualToNode} when {@link #equals} is {@code true}, or a {@link
+   * NotEqualNode} when it is {@code false}, provided one operand is null. It also matches a {@link
+   * ConditionalNotNode} whose operand matches with the opposite polarity, and a {@link
+   * TypeCastNode} whose operand matches with the same polarity. Any other node yields {@link
+   * Optional#empty()}. For example, visiting {@code e == null}, {@code !(e != null)}, or {@code
+   * (boolean) (e == null)} with {@code new NullEqualityVisitor(true)} returns an {@link Optional}
+   * of node {@code e}.
+   */
+  private static final class NullEqualityVisitor
+      extends AbstractNodeVisitor<Optional<Node>, AccessPathNullnessPropagation.SubNodeValues> {
+
+    private static final NullEqualityVisitor IS_NULL = new NullEqualityVisitor(true);
+    private static final NullEqualityVisitor NOT_NULL = new NullEqualityVisitor(false);
+
+    private final boolean equals;
+
+    NullEqualityVisitor(boolean equals) {
+      this.equals = equals;
+    }
+
+    @Override
+    public Optional<Node> visitNode(Node node, AccessPathNullnessPropagation.SubNodeValues unused) {
+      return Optional.empty();
+    }
+
+    @Override
+    public Optional<Node> visitConditionalNot(
+        ConditionalNotNode conditionalNotNode, AccessPathNullnessPropagation.SubNodeValues inputs) {
+      NullEqualityVisitor negated = equals ? NOT_NULL : IS_NULL;
+      return conditionalNotNode.getOperand().accept(negated, inputs);
+    }
+
+    @Override
+    public Optional<Node> visitTypeCast(
+        TypeCastNode typeCastNode, AccessPathNullnessPropagation.SubNodeValues inputs) {
+      return typeCastNode.getOperand().accept(this, inputs);
+    }
+
+    @Override
+    public Optional<Node> visitNotEqual(
+        NotEqualNode notEqualNode, AccessPathNullnessPropagation.SubNodeValues inputs) {
+      if (equals) {
+        return Optional.empty();
+      } else {
+        return visit(notEqualNode, inputs);
+      }
+    }
+
+    @Override
+    public Optional<Node> visitEqualTo(
+        EqualToNode equalToNode, AccessPathNullnessPropagation.SubNodeValues inputs) {
+      if (equals) {
+        return visit(equalToNode, inputs);
+      } else {
+        return Optional.empty();
+      }
+    }
+
+    private Optional<Node> visit(
+        BinaryOperationNode comparison, AccessPathNullnessPropagation.SubNodeValues inputs) {
+      Node lhs = comparison.getLeftOperand();
+      Node rhs = comparison.getRightOperand();
+      Nullness lhsNullness = inputs.valueOfSubNode(lhs);
+      Nullness rhsNullness = inputs.valueOfSubNode(rhs);
+      if (lhsNullness.isNull()) {
+        return Optional.of(rhs);
+      }
+      if (rhsNullness.isNull()) {
+        return Optional.of(lhs);
+      }
+      return Optional.empty();
+    }
   }
 }

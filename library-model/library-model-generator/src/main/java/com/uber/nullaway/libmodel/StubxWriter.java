@@ -1,0 +1,240 @@
+package com.uber.nullaway.libmodel;
+
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/** Simple writer for the astubx format. */
+public final class StubxWriter {
+  /**
+   * The file magic number for version 0 .astubx files. It should be the first four bytes of any
+   * compatible .astubx file. Unused field, keeping for reference.
+   */
+  @SuppressWarnings("UnusedVariable")
+  private static final int VERSION_0_FILE_MAGIC_NUMBER = 691458791;
+
+  /**
+   * The file magic number for version 1 .astubx files. It should be the first four bytes of any
+   * compatible .astubx file.
+   */
+  private static final int VERSION_1_FILE_MAGIC_NUMBER = 481874642;
+
+  /**
+   * The file magic number for version 2 .astubx files. Version 2 is version 1 plus a trailing
+   * section for nullable fields. We only write version 2 if there are nullable fields, so older
+   * readers can still read files that do not need the new section.
+   */
+  private static final int VERSION_2_FILE_MAGIC_NUMBER = 481874643;
+
+  /**
+   * This method writes the provided list of annotations to a DataOutputStream in the astubx format.
+   *
+   * @param out Output stream.
+   * @param importedAnnotations Mapping of 'custom annotations' to their 'definition classes'.
+   * @param packageAnnotations Map of 'package names' to their 'list of package-level annotations'.
+   * @param typeAnnotations Map of 'type names' to their 'list of type annotations'.
+   * @param methodRecords Map of 'method signatures' to their 'method annotations record'. Method
+   *     annotations record consists of return value annotations and argument annotations. {@link
+   *     MethodAnnotationsRecord}
+   * @throws IOException On output error.
+   */
+  public static void write(
+      DataOutputStream out,
+      Map<String, String> importedAnnotations,
+      Map<String, Set<String>> packageAnnotations,
+      Map<String, Set<String>> typeAnnotations,
+      Map<String, MethodAnnotationsRecord> methodRecords,
+      Set<String> nullMarkedClasses,
+      Map<String, Set<Integer>> nullableUpperBounds)
+      throws IOException {
+    write(
+        out,
+        importedAnnotations,
+        packageAnnotations,
+        typeAnnotations,
+        methodRecords,
+        nullMarkedClasses,
+        nullableUpperBounds,
+        Map.of());
+  }
+
+  /**
+   * Same as {@link #write(DataOutputStream, Map, Map, Map, Map, Set, Map)}, plus nullable fields.
+   *
+   * @param nullableFields Map of flat class name to the names of its nullable fields. If not empty,
+   *     the file is written in version 2 format.
+   * @throws IOException On output error.
+   */
+  public static void write(
+      DataOutputStream out,
+      Map<String, String> importedAnnotations,
+      Map<String, Set<String>> packageAnnotations,
+      Map<String, Set<String>> typeAnnotations,
+      Map<String, MethodAnnotationsRecord> methodRecords,
+      Set<String> nullMarkedClasses,
+      Map<String, Set<Integer>> nullableUpperBounds,
+      Map<String, Set<String>> nullableFields)
+      throws IOException {
+    boolean writeFields = !nullableFields.isEmpty();
+    // File format version/magic number
+    out.writeInt(writeFields ? VERSION_2_FILE_MAGIC_NUMBER : VERSION_1_FILE_MAGIC_NUMBER);
+    // Followed by the number of string dictionary entries
+    int numStringEntries = 0;
+    Map<String, Integer> encodingDictionary = new LinkedHashMap<>();
+    List<String> strings = new ArrayList<String>();
+    List<String> kindNames =
+        Arrays.stream(NestedAnnotationInfo.TypePathEntry.Kind.values()).map(Enum::name).toList();
+    List<String> annotationNames =
+        Arrays.stream(NestedAnnotationInfo.Annotation.values()).map(Enum::name).toList();
+    ImmutableList<Collection<String>> keysets =
+        ImmutableList.of(
+            importedAnnotations.values(),
+            packageAnnotations.keySet(),
+            typeAnnotations.keySet(),
+            methodRecords.keySet(),
+            nullMarkedClasses,
+            nullableUpperBounds.keySet(),
+            kindNames,
+            annotationNames,
+            nullableFields.keySet(),
+            nullableFields.values().stream().flatMap(Set::stream).toList());
+    for (Collection<String> keyset : keysets) {
+      for (String key : keyset) {
+        if (encodingDictionary.containsKey(key)) {
+          continue;
+        }
+        strings.add(key);
+        encodingDictionary.put(key, numStringEntries);
+        ++numStringEntries;
+      }
+    }
+    out.writeInt(numStringEntries);
+    // Followed by the entries themselves
+    for (String s : strings) {
+      out.writeUTF(s);
+    }
+    // Followed by the number of encoded package annotation records
+    int packageAnnotationSize = 0;
+    for (Map.Entry<String, Set<String>> entry : packageAnnotations.entrySet()) {
+      packageAnnotationSize += entry.getValue().size();
+    }
+    out.writeInt(packageAnnotationSize);
+    // Followed by those records as pairs of ints pointing into the dictionary
+    for (Map.Entry<String, Set<String>> entry : packageAnnotations.entrySet()) {
+      for (String annot : entry.getValue()) {
+        out.writeInt(encodingDictionary.get(entry.getKey()));
+        out.writeInt(encodingDictionary.get(importedAnnotations.get(annot)));
+      }
+    }
+    // Followed by the number of encoded type annotation records
+    int typeAnnotationSize = 0;
+    for (Map.Entry<String, Set<String>> entry : typeAnnotations.entrySet()) {
+      typeAnnotationSize += entry.getValue().size();
+    }
+    out.writeInt(typeAnnotationSize);
+    // Followed by those records as pairs of ints pointing into the dictionary
+    for (Map.Entry<String, Set<String>> entry : typeAnnotations.entrySet()) {
+      for (String annot : entry.getValue()) {
+        out.writeInt(encodingDictionary.get(entry.getKey()));
+        out.writeInt(encodingDictionary.get(importedAnnotations.get(annot)));
+      }
+    }
+    // Followed by the number of encoded method return/declaration annotation records
+    int methodAnnotationSize = 0;
+    int methodTypeParamNullableUpperbounds = 0;
+    int methodArgumentRecordsSize = 0;
+    int methodNestedAnnotSize = 0;
+    for (Map.Entry<String, MethodAnnotationsRecord> entry : methodRecords.entrySet()) {
+      methodAnnotationSize += entry.getValue().methodAnnotations().size();
+      methodTypeParamNullableUpperbounds += entry.getValue().typeParamNullableUpperbounds().size();
+      methodArgumentRecordsSize += entry.getValue().argumentAnnotations().size();
+      methodNestedAnnotSize += entry.getValue().nestedAnnotationInfo().size();
+    }
+    out.writeInt(methodAnnotationSize);
+    // Followed by those records as pairs of ints pointing into the dictionary
+    for (Map.Entry<String, MethodAnnotationsRecord> entry : methodRecords.entrySet()) {
+      for (String annot : entry.getValue().methodAnnotations()) {
+        out.writeInt(encodingDictionary.get(entry.getKey()));
+        out.writeInt(encodingDictionary.get(importedAnnotations.get(annot)));
+      }
+    }
+    out.writeInt(methodTypeParamNullableUpperbounds);
+    // followed by method type variables
+    for (Map.Entry<String, MethodAnnotationsRecord> entry : methodRecords.entrySet()) {
+      for (int nullableIndex : entry.getValue().typeParamNullableUpperbounds()) {
+        out.writeInt(encodingDictionary.get(entry.getKey()));
+        out.writeInt(nullableIndex);
+      }
+    }
+    // Followed by the number of encoded method argument annotation records
+    out.writeInt(methodArgumentRecordsSize);
+    // Followed by those records as a triplet of ints ( 0 and 2 point in the dictionary, 1 is the
+    //  argument position)
+    for (Map.Entry<String, MethodAnnotationsRecord> entry : methodRecords.entrySet()) {
+      for (Map.Entry<Integer, ImmutableSet<String>> argEntry :
+          entry.getValue().argumentAnnotations().entrySet()) {
+        for (String annot : argEntry.getValue()) {
+          out.writeInt(encodingDictionary.get(entry.getKey()));
+          out.writeInt(argEntry.getKey());
+          out.writeInt(encodingDictionary.get(importedAnnotations.get(annot)));
+        }
+      }
+    }
+    // Followed by the number of nested annotation information records
+    out.writeInt(methodNestedAnnotSize);
+    // Followed by the nested annotation information
+    for (Map.Entry<String, MethodAnnotationsRecord> entry : methodRecords.entrySet()) {
+      for (Map.Entry<Integer, NestedAnnotationInfo> nestedInfoEntry :
+          entry.getValue().nestedAnnotationInfo().entries()) {
+        // index, annotation, list size, (TypePathEntry) list of (kind, index)
+        out.writeInt(encodingDictionary.get(entry.getKey()));
+        out.writeInt(nestedInfoEntry.getKey()); // -1: return type, 0+: parameter index
+        NestedAnnotationInfo nestedInfo = nestedInfoEntry.getValue();
+        out.writeInt(encodingDictionary.get(nestedInfo.annotation().name())); // annotation type
+        out.writeInt(nestedInfo.typePath().size()); // length of TypePathEntry
+        for (NestedAnnotationInfo.TypePathEntry typePath : nestedInfoEntry.getValue().typePath()) {
+          out.writeInt(encodingDictionary.get(typePath.kind().name())); // Kind of nested type
+          out.writeInt(typePath.index()); // index related to nested type
+        }
+      }
+    }
+    // Followed by the number of NullMarked Classes
+    out.writeInt(nullMarkedClasses.size());
+    // Followed by the null marked class records from the dictionary
+    for (String entry : nullMarkedClasses) {
+      out.writeInt(encodingDictionary.get(entry));
+    }
+    // Followed by the number of nullable upper bounds records
+    out.writeInt(nullableUpperBounds.size());
+    for (Map.Entry<String, Set<Integer>> entry : nullableUpperBounds.entrySet()) {
+      // Followed by the number of parameters with nullable upper bound
+      Set<Integer> parameters = entry.getValue();
+      out.writeInt(parameters.size());
+      for (Integer parameter : parameters) {
+        // Followed by the nullable upper bound record as a pair of integers
+        out.writeInt(encodingDictionary.get(entry.getKey()));
+        out.writeInt(parameter);
+      }
+    }
+    if (writeFields) {
+      // Version 2 only: followed by the number of classes with nullable fields
+      out.writeInt(nullableFields.size());
+      for (Map.Entry<String, Set<String>> entry : nullableFields.entrySet()) {
+        // Followed by the class name, the number of fields, and each field name
+        out.writeInt(encodingDictionary.get(entry.getKey()));
+        out.writeInt(entry.getValue().size());
+        for (String fieldName : entry.getValue()) {
+          out.writeInt(encodingDictionary.get(fieldName));
+        }
+      }
+    }
+  }
+}

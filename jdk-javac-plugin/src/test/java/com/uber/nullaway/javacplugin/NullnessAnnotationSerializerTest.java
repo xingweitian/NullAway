@@ -1,0 +1,797 @@
+package com.uber.nullaway.javacplugin;
+
+import static com.google.errorprone.BugPattern.SeverityLevel.WARNING;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
+
+import com.google.common.collect.ImmutableList;
+import com.google.common.reflect.TypeToken;
+import com.google.errorprone.BugPattern;
+import com.google.errorprone.CompilationTestHelper;
+import com.google.errorprone.bugpatterns.BugChecker;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonDeserializer;
+import com.google.gson.JsonElement;
+import com.uber.nullaway.javacplugin.NullnessAnnotationSerializer.ClassInfo;
+import com.uber.nullaway.javacplugin.NullnessAnnotationSerializer.FieldInfo;
+import com.uber.nullaway.javacplugin.NullnessAnnotationSerializer.MethodInfo;
+import com.uber.nullaway.javacplugin.NullnessAnnotationSerializer.TypeParamInfo;
+import com.uber.nullaway.libmodel.NestedAnnotationInfo;
+import com.uber.nullaway.libmodel.NestedAnnotationInfo.Annotation;
+import com.uber.nullaway.libmodel.NestedAnnotationInfo.TypePathEntry;
+import java.io.IOException;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Stream;
+import org.junit.Before;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
+
+public class NullnessAnnotationSerializerTest {
+
+  private CompilationTestHelper compilationTestHelper;
+
+  @Rule public final TemporaryFolder temporaryFolder = new TemporaryFolder();
+
+  /**
+   * A dummy checker to allow us to use {@link CompilationTestHelper} to compile Java code for
+   * testing, as it requires a {@link BugChecker} to run.
+   */
+  @BugPattern(summary = "Dummy checker to use CompilationTestHelper", severity = WARNING)
+  public static class DummyChecker extends BugChecker {
+    public DummyChecker() {}
+  }
+
+  @Before
+  public void setup() {
+    String tempPath = temporaryFolder.getRoot().getAbsolutePath();
+    compilationTestHelper =
+        CompilationTestHelper.newInstance(DummyChecker.class, getClass())
+            .setArgs(
+                Arrays.asList(
+                    "-d",
+                    tempPath,
+                    "--module-path",
+                    System.getProperty("test.module.path"),
+                    "-Xplugin:NullnessAnnotationSerializer " + tempPath));
+  }
+
+  @Test
+  public void nullMarkedClassNoModule() {
+    compilationTestHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            import org.jspecify.annotations.NullMarked;
+            @NullMarked
+            class Foo {}
+            """)
+        .doTest();
+    Map<String, List<ClassInfo>> moduleClasses = getParsedJSON();
+    assertThat(moduleClasses)
+        .containsExactlyEntriesOf(
+            Map.of(
+                "unnamed",
+                List.of(new ClassInfo("Foo", "Foo", true, false, List.of(), List.of()))));
+  }
+
+  @Test
+  public void nullMarkedClassWithModule() {
+    compilationTestHelper
+        .addSourceLines(
+            "module-info.java",
+            """
+            module com.example {
+                requires java.base;
+                requires org.jspecify;
+            }
+            """)
+        .addSourceLines(
+            "Foo.java",
+            """
+            import org.jspecify.annotations.NullMarked;
+            import org.jspecify.annotations.Nullable;
+            @NullMarked
+            class Foo {
+              public @Nullable String NullableReturn(@Nullable Integer i) { return null;}
+            }
+            """)
+        .doTest();
+    Map<String, List<ClassInfo>> moduleClasses = getParsedJSON();
+    assertThat(moduleClasses)
+        .containsExactlyEntriesOf(
+            Map.of(
+                "com.example",
+                List.of(
+                    new ClassInfo(
+                        "Foo",
+                        "Foo",
+                        true,
+                        false,
+                        List.of(),
+                        List.of(
+                            new MethodInfo(
+                                "java.lang.@org.jspecify.annotations.Nullable String",
+                                "NullableReturn(java.lang.@org.jspecify.annotations.Nullable Integer)",
+                                false,
+                                false,
+                                List.of(),
+                                Map.of()))))));
+  }
+
+  @Test
+  public void privateMethodsExcluded() {
+    compilationTestHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            import org.jspecify.annotations.NullMarked;
+            import org.jspecify.annotations.Nullable;
+            @NullMarked
+            class Foo {
+              void publicMethod(@Nullable String s) {}
+              private void privateMethod(@Nullable String s) {}
+            }
+            """)
+        .doTest();
+    Map<String, List<ClassInfo>> moduleClasses = getParsedJSON();
+    assertThat(moduleClasses)
+        .containsExactlyEntriesOf(
+            Map.of(
+                "unnamed",
+                List.of(
+                    new ClassInfo(
+                        "Foo",
+                        "Foo",
+                        true,
+                        false,
+                        List.of(),
+                        List.of(
+                            new MethodInfo(
+                                "void",
+                                "publicMethod(java.lang.@org.jspecify.annotations.Nullable String)",
+                                false,
+                                false,
+                                List.of(),
+                                Map.of()))))));
+  }
+
+  @Test
+  public void innerAndAnonymousClasses() {
+    compilationTestHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            import org.jspecify.annotations.*;
+            @NullMarked
+            class Foo {
+              @NullUnmarked
+              class Inner { }
+              private class PrivateInner<T extends @Nullable Object> { }
+              void method() {
+                Runnable r = new Runnable() { public void run() {} };
+              }
+            }
+            """)
+        .doTest();
+    Map<String, List<ClassInfo>> moduleClasses = getParsedJSON();
+    assertThat(moduleClasses)
+        .containsExactlyEntriesOf(
+            Map.of(
+                "unnamed",
+                List.of(
+                    new ClassInfo("Inner", "Foo.Inner", false, true, List.of(), List.of()),
+                    new ClassInfo("Foo", "Foo", true, false, List.of(), List.of()))));
+  }
+
+  @Test
+  public void nullableFields() {
+    compilationTestHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            import org.jspecify.annotations.*;
+            @NullMarked
+            class Foo {
+              public @Nullable String a;
+              String b = "";
+              private @Nullable String c;
+              protected @Nullable String g;
+              @Nullable String[] d = new String[0];
+              String @Nullable [] e;
+              static class Inner {
+                @Nullable Object f;
+              }
+              void m(String p) {
+                @Nullable String local = null;
+              }
+            }
+            """)
+        .doTest();
+    Map<String, List<ClassInfo>> moduleClasses = getParsedJSON();
+    List<FieldInfo> fields =
+        moduleClasses.get("unnamed").stream().flatMap(c -> c.fields().stream()).toList();
+    assertThat(fields)
+        .extracting(FieldInfo::name, FieldInfo::enclosingClassFlatName)
+        .containsExactlyInAnyOrder(
+            tuple("a", "Foo"), tuple("g", "Foo"), tuple("e", "Foo"), tuple("f", "Foo$Inner"));
+  }
+
+  @Test
+  public void typeParameters() {
+    compilationTestHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            import org.jspecify.annotations.*;
+            @NullMarked
+            public class Foo<T extends @Nullable Object> {
+              public <U extends @Nullable Object> U make(U u) { throw new RuntimeException(); }
+            }
+            """)
+        .doTest();
+    Map<String, List<ClassInfo>> moduleClasses = getParsedJSON();
+    assertThat(moduleClasses)
+        .containsExactlyEntriesOf(
+            Map.of(
+                "unnamed",
+                List.of(
+                    new ClassInfo(
+                        "Foo",
+                        "Foo<T>",
+                        true,
+                        false,
+                        List.of(new TypeParamInfo("T", List.of("@Nullable Object"))),
+                        List.of(
+                            new MethodInfo(
+                                "U",
+                                "<U>make(U)",
+                                false,
+                                false,
+                                List.of(new TypeParamInfo("U", List.of("@Nullable Object"))),
+                                Map.of()))))));
+  }
+
+  @Test
+  public void varargsNullableArrayOnly() {
+    compilationTestHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            import org.jspecify.annotations.*;
+            @NullMarked
+            public class Foo {
+              public static int hash(Object @Nullable ... args) { return 0; }
+            }
+            """)
+        .doTest();
+    Map<String, List<ClassInfo>> moduleClasses = getParsedJSON();
+    assertThat(moduleClasses)
+        .containsExactlyEntriesOf(
+            Map.of(
+                "unnamed",
+                List.of(
+                    new ClassInfo(
+                        "Foo",
+                        "Foo",
+                        true,
+                        false,
+                        List.of(),
+                        List.of(
+                            new MethodInfo(
+                                "int",
+                                "hash(java.lang.Object@org.jspecify.annotations.Nullable...)",
+                                false,
+                                false,
+                                List.of(),
+                                Map.of()))))));
+  }
+
+  @Test
+  public void varargsNullableElementsOnly() {
+    compilationTestHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            import org.jspecify.annotations.*;
+            @NullMarked
+            public class Foo {
+              public static int hash(@Nullable Object... args) { return 0; }
+            }
+            """)
+        .doTest();
+    Map<String, List<ClassInfo>> moduleClasses = getParsedJSON();
+    assertThat(moduleClasses)
+        .containsExactlyEntriesOf(
+            Map.of(
+                "unnamed",
+                List.of(
+                    new ClassInfo(
+                        "Foo",
+                        "Foo",
+                        true,
+                        false,
+                        List.of(),
+                        List.of(
+                            new MethodInfo(
+                                "int",
+                                "hash(java.lang.@org.jspecify.annotations.Nullable Object...)",
+                                false,
+                                false,
+                                List.of(),
+                                Map.of(
+                                    0,
+                                    Set.of(
+                                        new NestedAnnotationInfo(
+                                            Annotation.NULLABLE,
+                                            ImmutableList.of(
+                                                new TypePathEntry(
+                                                    TypePathEntry.Kind.ARRAY_ELEMENT, -1)))))))))));
+  }
+
+  @Test
+  public void varargsNullableArrayAndElements() {
+    compilationTestHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            import org.jspecify.annotations.*;
+            @NullMarked
+            public class Foo {
+              public static int hash(@Nullable Object @Nullable... args) { return 0; }
+            }
+            """)
+        .doTest();
+    Map<String, List<ClassInfo>> moduleClasses = getParsedJSON();
+    assertThat(moduleClasses)
+        .containsExactlyEntriesOf(
+            Map.of(
+                "unnamed",
+                List.of(
+                    new ClassInfo(
+                        "Foo",
+                        "Foo",
+                        true,
+                        false,
+                        List.of(),
+                        List.of(
+                            new MethodInfo(
+                                "int",
+                                "hash(java.lang.@org.jspecify.annotations.Nullable Object@org.jspecify.annotations.Nullable...)",
+                                false,
+                                false,
+                                List.of(),
+                                Map.of(
+                                    0,
+                                    Set.of(
+                                        new NestedAnnotationInfo(
+                                            Annotation.NULLABLE,
+                                            ImmutableList.of(
+                                                new TypePathEntry(
+                                                    TypePathEntry.Kind.ARRAY_ELEMENT, -1)))))))))));
+  }
+
+  @Test
+  public void arrayParametersNullableArrayVsElements() {
+    compilationTestHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            import org.jspecify.annotations.*;
+            @NullMarked
+            public class Foo {
+              public static void arrayNullable(String @Nullable [] arr) {}
+              public static void elementsNullable(@Nullable String[] arr) {}
+              public static void bothNullable(@Nullable String @Nullable [] arr) {}
+            }
+            """)
+        .doTest();
+    Map<String, List<ClassInfo>> moduleClasses = getParsedJSON();
+    assertThat(moduleClasses)
+        .containsExactlyEntriesOf(
+            Map.of(
+                "unnamed",
+                List.of(
+                    new ClassInfo(
+                        "Foo",
+                        "Foo",
+                        true,
+                        false,
+                        List.of(),
+                        List.of(
+                            new MethodInfo(
+                                "void",
+                                "arrayNullable(java.lang.String @org.jspecify.annotations.Nullable [])",
+                                false,
+                                false,
+                                List.of(),
+                                Map.of()),
+                            new MethodInfo(
+                                "void",
+                                "elementsNullable(java.lang.@org.jspecify.annotations.Nullable String[])",
+                                false,
+                                false,
+                                List.of(),
+                                Map.of(
+                                    0,
+                                    Set.of(
+                                        new NestedAnnotationInfo(
+                                            Annotation.NULLABLE,
+                                            ImmutableList.of(
+                                                new TypePathEntry(
+                                                    TypePathEntry.Kind.ARRAY_ELEMENT, -1)))))),
+                            new MethodInfo(
+                                "void",
+                                "bothNullable(java.lang.@org.jspecify.annotations.Nullable String @org.jspecify.annotations.Nullable [])",
+                                false,
+                                false,
+                                List.of(),
+                                Map.of(
+                                    0,
+                                    Set.of(
+                                        new NestedAnnotationInfo(
+                                            Annotation.NULLABLE,
+                                            ImmutableList.of(
+                                                new TypePathEntry(
+                                                    TypePathEntry.Kind.ARRAY_ELEMENT, -1)))))))))));
+  }
+
+  @Test
+  public void skipNonAnnotatedClasses() {
+    compilationTestHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            import org.jspecify.annotations.*;
+            @NullMarked
+            class Foo {
+              class NoAnnotation { void noAnnotMethod() {} }
+              class Inner {
+                void annotatedMethod(@Nullable String s) {}
+              }
+              class AnnotatedGeneric<T extends @Nullable Object> {}
+            }
+            """)
+        .doTest();
+    Map<String, List<ClassInfo>> moduleClasses = getParsedJSON();
+    assertThat(moduleClasses)
+        .containsExactlyEntriesOf(
+            Map.of(
+                "unnamed",
+                List.of(
+                    new ClassInfo(
+                        "Inner",
+                        "Foo.Inner",
+                        false,
+                        false,
+                        List.of(),
+                        List.of(
+                            new MethodInfo(
+                                "void",
+                                "annotatedMethod(java.lang.@org.jspecify.annotations.Nullable String)",
+                                false,
+                                false,
+                                List.of(),
+                                Map.of()))),
+                    new ClassInfo(
+                        "AnnotatedGeneric",
+                        "Foo.AnnotatedGeneric<T>",
+                        false,
+                        false,
+                        List.of(new TypeParamInfo("T", List.of("@Nullable Object"))),
+                        List.of()),
+                    new ClassInfo("Foo", "Foo", true, false, List.of(), List.of()))));
+  }
+
+  @Test
+  public void skipNonAnnotatedMethods() {
+    compilationTestHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            import org.jspecify.annotations.*;
+            @NullMarked
+            class Foo {
+              void noAnnotation() {}
+              <T extends @Nullable Object> void annotatedTypeArgument() {}
+              @Nullable String annotatedReturnType() { throw new RuntimeException(); }
+              void annotatedParameter(@Nullable String s) {}
+            }
+            """)
+        .doTest();
+    Map<String, List<ClassInfo>> moduleClasses = getParsedJSON();
+    assertThat(moduleClasses)
+        .containsExactlyEntriesOf(
+            Map.of(
+                "unnamed",
+                List.of(
+                    new ClassInfo(
+                        "Foo",
+                        "Foo",
+                        true,
+                        false,
+                        List.of(),
+                        List.of(
+                            new MethodInfo(
+                                "void",
+                                "<T>annotatedTypeArgument()",
+                                false,
+                                false,
+                                List.of(new TypeParamInfo("T", List.of("@Nullable Object"))),
+                                Map.of()),
+                            new MethodInfo(
+                                "java.lang.@org.jspecify.annotations.Nullable String",
+                                "annotatedReturnType()",
+                                false,
+                                false,
+                                List.of(),
+                                Map.of()),
+                            new MethodInfo(
+                                "void",
+                                "annotatedParameter(java.lang.@org.jspecify.annotations.Nullable String)",
+                                false,
+                                false,
+                                List.of(),
+                                Map.of()))))));
+  }
+
+  @Test
+  public void annotationDeepScan() {
+    compilationTestHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            import org.jspecify.annotations.*;
+            import java.util.List;
+            @NullMarked
+            public class Foo {
+              interface Bar {}
+              public void arrayType(String @Nullable [] arr) {}
+              public void wildcard(List<? super @Nullable Integer> list) {}
+              public <U extends @Nullable Object> void typeVariable(U u) {}
+              public <T extends @Nullable String & Bar> void intersection(T t) {}
+              public <T> void nullableOnTypeVar(List<@Nullable T> list) {}
+            }
+            """)
+        .doTest();
+    Map<String, List<ClassInfo>> moduleClasses = getParsedJSON();
+    assertThat(moduleClasses)
+        .containsExactlyEntriesOf(
+            Map.of(
+                "unnamed",
+                List.of(
+                    new ClassInfo(
+                        "Foo",
+                        "Foo",
+                        true,
+                        false,
+                        List.of(),
+                        List.of(
+                            new MethodInfo(
+                                "void",
+                                "arrayType(java.lang.String @org.jspecify.annotations.Nullable [])",
+                                false,
+                                false,
+                                List.of(),
+                                Map.of()),
+                            new MethodInfo(
+                                "void",
+                                "wildcard(java.util.List<? super java.lang.@org.jspecify.annotations.Nullable Integer>)",
+                                false,
+                                false,
+                                List.of(),
+                                Map.of(
+                                    0,
+                                    Set.of(
+                                        new NestedAnnotationInfo(
+                                            Annotation.NULLABLE,
+                                            ImmutableList.of(
+                                                new TypePathEntry(
+                                                    TypePathEntry.Kind.TYPE_ARGUMENT, 0),
+                                                new TypePathEntry(
+                                                    TypePathEntry.Kind.WILDCARD_BOUND, 1)))))),
+                            new MethodInfo(
+                                "void",
+                                "<U>typeVariable(U)",
+                                false,
+                                false,
+                                List.of(new TypeParamInfo("U", List.of("@Nullable Object"))),
+                                Map.of()),
+                            new MethodInfo(
+                                "void",
+                                "<T>intersection(T)",
+                                false,
+                                false,
+                                List.of(new TypeParamInfo("T", List.of("@Nullable String", "Bar"))),
+                                Map.of()),
+                            new MethodInfo(
+                                "void",
+                                "<T>nullableOnTypeVar(java.util.List<@org.jspecify.annotations.Nullable T>)",
+                                false,
+                                false,
+                                List.of(new TypeParamInfo("T", List.of())),
+                                Map.of(
+                                    0,
+                                    Set.of(
+                                        new NestedAnnotationInfo(
+                                            Annotation.NULLABLE,
+                                            ImmutableList.of(
+                                                new TypePathEntry(
+                                                    TypePathEntry.Kind.TYPE_ARGUMENT, 0)))))))))));
+  }
+
+  @Test
+  public void nestedAnnotationsForMethods() {
+    compilationTestHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            import org.jspecify.annotations.*;
+            import java.util.*;
+            @NullMarked
+            public abstract class Foo {
+              public abstract <E extends @Nullable Object> Collection<E> checkedCollection(Collection<E> c, Class<@NonNull E> type);
+              public abstract List<@Nullable String> nestedReturnType();
+              public abstract void nestedParameterType(@Nullable String [] arr, List<@NonNull String>[] s);
+              public abstract List<? extends @Nullable String> wildcardUpperBound();
+              public abstract List<List<String @Nullable []>> nestedArrayType();
+            }
+            """)
+        .doTest();
+    Map<String, List<ClassInfo>> moduleClasses = getParsedJSON();
+    assertThat(moduleClasses)
+        .containsExactlyEntriesOf(
+            Map.of(
+                "unnamed",
+                List.of(
+                    new ClassInfo(
+                        "Foo",
+                        "Foo",
+                        true,
+                        false,
+                        List.of(),
+                        List.of(
+                            new MethodInfo(
+                                "java.util.Collection<E>",
+                                "<E>checkedCollection(java.util.Collection<E>,java.lang.Class<@org.jspecify.annotations.NonNull E>)",
+                                false,
+                                false,
+                                List.of(new TypeParamInfo("E", List.of("@Nullable Object"))),
+                                Map.of(
+                                    1,
+                                    Set.of(
+                                        new NestedAnnotationInfo(
+                                            Annotation.NONNULL,
+                                            ImmutableList.of(
+                                                new TypePathEntry(
+                                                    TypePathEntry.Kind.TYPE_ARGUMENT, 0)))))),
+                            new MethodInfo(
+                                "java.util.List<java.lang.@org.jspecify.annotations.Nullable String>",
+                                "nestedReturnType()",
+                                false,
+                                false,
+                                List.of(),
+                                Map.of(
+                                    -1,
+                                    Set.of(
+                                        new NestedAnnotationInfo(
+                                            Annotation.NULLABLE,
+                                            ImmutableList.of(
+                                                new TypePathEntry(
+                                                    TypePathEntry.Kind.TYPE_ARGUMENT, 0)))))),
+                            new MethodInfo(
+                                "void",
+                                "nestedParameterType(java.lang.@org.jspecify.annotations.Nullable String[],java.util.List<java.lang.@org.jspecify.annotations.NonNull String>[])",
+                                false,
+                                false,
+                                List.of(),
+                                Map.of(
+                                    0,
+                                        Set.of(
+                                            new NestedAnnotationInfo(
+                                                Annotation.NULLABLE,
+                                                ImmutableList.of(
+                                                    new TypePathEntry(
+                                                        TypePathEntry.Kind.ARRAY_ELEMENT, -1)))),
+                                    1,
+                                        Set.of(
+                                            new NestedAnnotationInfo(
+                                                Annotation.NONNULL,
+                                                ImmutableList.of(
+                                                    new TypePathEntry(
+                                                        TypePathEntry.Kind.ARRAY_ELEMENT, -1),
+                                                    new TypePathEntry(
+                                                        TypePathEntry.Kind.TYPE_ARGUMENT, 0)))))),
+                            new MethodInfo(
+                                "java.util.List<? extends java.lang.@org.jspecify.annotations.Nullable String>",
+                                "wildcardUpperBound()",
+                                false,
+                                false,
+                                List.of(),
+                                Map.of(
+                                    -1,
+                                    Set.of(
+                                        new NestedAnnotationInfo(
+                                            Annotation.NULLABLE,
+                                            ImmutableList.of(
+                                                new TypePathEntry(
+                                                    TypePathEntry.Kind.TYPE_ARGUMENT, 0),
+                                                new TypePathEntry(
+                                                    TypePathEntry.Kind.WILDCARD_BOUND, 0)))))),
+                            new MethodInfo(
+                                "java.util.List<java.util.List<java.lang.String @org.jspecify.annotations.Nullable []>>",
+                                "nestedArrayType()",
+                                false,
+                                false,
+                                List.of(),
+                                Map.of(
+                                    -1,
+                                    Set.of(
+                                        new NestedAnnotationInfo(
+                                            Annotation.NULLABLE,
+                                            ImmutableList.of(
+                                                new TypePathEntry(
+                                                    TypePathEntry.Kind.TYPE_ARGUMENT, 0),
+                                                new TypePathEntry(
+                                                    TypePathEntry.Kind.TYPE_ARGUMENT, 0)))))))))));
+  }
+
+  private Map<String, List<ClassInfo>> getParsedJSON() {
+    String tempPath = temporaryFolder.getRoot().getAbsolutePath();
+
+    // Define the Adapter for ImmutableList
+    JsonDeserializer<ImmutableList<?>> immutableListAdapter =
+        (json, typeOfT, context) -> {
+          ImmutableList.Builder<Object> builder = ImmutableList.builder();
+
+          if (json.isJsonArray()) {
+            JsonArray array = json.getAsJsonArray();
+            // Get the component type of list (with defensive check)
+            if (!(typeOfT instanceof ParameterizedType paramType)) {
+              throw new IllegalArgumentException("Expected parameterized ImmutableList type");
+            }
+            Type contentClass = paramType.getActualTypeArguments()[0];
+
+            for (JsonElement element : array) {
+              // Deserialize the inner element using Gson's context
+              Object value = context.deserialize(element, contentClass);
+              builder.add(value);
+            }
+          }
+          return builder.build();
+        };
+
+    // list all json files in the  tempPath
+    try (Stream<Path> stream = Files.list(Paths.get(tempPath))) {
+      return stream
+          .filter(path -> path.toString().endsWith(".json"))
+          .findFirst()
+          .<Map<String, List<ClassInfo>>>map(
+              path -> {
+                try {
+                  return new GsonBuilder()
+                      .registerTypeAdapter(ImmutableList.class, immutableListAdapter)
+                      .create()
+                      .fromJson(
+                          new String(Files.readAllBytes(path), StandardCharsets.UTF_8),
+                          new TypeToken<Map<String, List<ClassInfo>>>() {}.getType());
+                } catch (IOException e) {
+                  throw new RuntimeException(e);
+                }
+              })
+          .orElseThrow();
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
+  }
+}

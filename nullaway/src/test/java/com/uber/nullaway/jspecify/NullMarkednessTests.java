@@ -1,0 +1,1976 @@
+package com.uber.nullaway.jspecify;
+
+import static com.uber.nullaway.NullAwayTestDataConstants.UTIL_SOURCE;
+
+import com.uber.nullaway.NullAwayTestsBase;
+import com.uber.nullaway.generics.JSpecifyJavacConfig;
+import java.util.Arrays;
+import java.util.List;
+import org.junit.Test;
+
+public class NullMarkednessTests extends NullAwayTestsBase {
+
+  @Test
+  public void nullMarkedPackageLevel() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "package-info.java",
+            """
+            @NullMarked package com.example.thirdparty;
+            import org.jspecify.annotations.NullMarked;
+            """)
+        .addSourceLines(
+            "ThirdPartyAnnotatedUtils.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.Nullable;
+            public class ThirdPartyAnnotatedUtils {
+              public static String toStringOrDefault(@Nullable Object o1, String s) {
+                if (o1 != null) {
+                  return o1.toString();
+                }
+                return s;
+              }
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import com.example.thirdparty.ThirdPartyAnnotatedUtils;
+            public class Test {
+              public static void test(Object o) {
+                // Safe: passing @NonNull on both args
+                ThirdPartyAnnotatedUtils.toStringOrDefault(o, "default");
+                // Safe: first arg is @Nullable
+                ThirdPartyAnnotatedUtils.toStringOrDefault(null, "default");
+                // Unsafe: @NullMarked means the second arg is @NonNull by default, not @Nullable
+                // BUG: Diagnostic contains: passing @Nullable parameter
+                ThirdPartyAnnotatedUtils.toStringOrDefault(o, null);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullMarkedPackageEnablesChecking() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "package-info.java",
+            """
+            @NullMarked package com.example.thirdparty;
+            import org.jspecify.annotations.NullMarked;
+            """)
+        .addSourceLines(
+            "Foo.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.Nullable;
+            public class Foo {
+              public static String foo(String s) {
+                return s;
+              }
+              public static void test() {
+                // BUG: Diagnostic contains: passing @Nullable parameter
+                foo(null);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullMarkedClassLevel() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.NullMarked;
+            @NullMarked
+            public class Foo {
+              public static String foo(String s) {
+                return s;
+              }
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import com.example.thirdparty.Foo;
+            public class Test {
+              public static void test(Object o) {
+                // BUG: Diagnostic contains: passing @Nullable parameter
+                Foo.foo(null);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullMarkedClassLevelEnablesChecking() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.NullMarked;
+            @NullMarked
+            public class Foo {
+              public static String foo(String s) {
+                return s;
+              }
+              public static void test(Object o) {
+                // BUG: Diagnostic contains: passing @Nullable parameter
+                foo(null);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullMarkedClassLevelOuter() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Bar.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.Nullable;
+            import org.jspecify.annotations.NullMarked;
+            @NullMarked
+            public class Bar {
+              public static class Foo {
+                public static String foo(String s) {
+                  return s;
+                }
+              }
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import com.example.thirdparty.Bar;
+            public class Test {
+              public static void test(Object o) {
+                // BUG: Diagnostic contains: passing @Nullable parameter
+                Bar.Foo.foo(null);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullMarkedClassLevelInner() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Bar.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.Nullable;
+            import org.jspecify.annotations.NullMarked;
+            public class Bar {
+              @NullMarked
+              public static class Foo {
+                public static String foo(String s) {
+                  return s;
+                }
+              }
+              public static void unchecked(Object o) {}
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import com.example.thirdparty.Bar;
+            public class Test {
+              public static void test(Object o) {
+                // BUG: Diagnostic contains: passing @Nullable parameter
+                Bar.Foo.foo(null);
+                Bar.unchecked(null);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullMarkedClassLevelInnerControlsChecking() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Bar.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.Nullable;
+            import org.jspecify.annotations.NullMarked;
+            public class Bar {
+              @NullMarked
+              public static class Foo {
+                public static String foo(String s) {
+                  return s;
+                }
+                // @NullMarked should also control checking of source
+                public static void test(Object o) {
+                  // BUG: Diagnostic contains: passing @Nullable parameter
+                  foo(null);
+                }
+              }
+              public static void unchecked() {
+                Object x = null;
+                // fine since this code is still unchecked
+                x.toString();
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullMarkedClassLevelLocalAndEnvironment() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.Nullable;
+            import org.jspecify.annotations.NullMarked;
+            public class Test {
+              public static Object test() {
+                Object x = null;
+                final Object y = new Object();
+                @NullMarked
+                class Local {
+                  public Object returnsNonNull() {
+                    return y;
+                  }
+                  @Nullable
+                  public Object returnsNullable() {
+                    return x;
+                  }
+                  public Object returnsNonNullWithError() {
+                    // BUG: Diagnostic contains: returning @Nullable expression
+                    return x;
+                  }
+                }
+                Local local = new Local();
+                // Allowed, since unmarked
+                return local.returnsNullable();
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullMarkedMethodLevel() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.NullMarked;
+            public class Foo {
+              @NullMarked
+              public static String foo(String s) {
+                return s;
+              }
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import com.example.thirdparty.Foo;
+            public class Test {
+              public static void test(Object o) {
+                // BUG: Diagnostic contains: passing @Nullable parameter
+                Foo.foo(null);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullMarkedMethodLevelScan() {
+    // Test that we turn on analysis/scanning within @NullMarked methods in a non-annotated
+    // package/class
+    defaultCompilationHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.NullMarked;
+            public class Foo {
+              @NullMarked
+              public static String foo(String s) {
+                return s;
+              }
+            }
+            """)
+        .addSourceLines(
+            "Bar.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.NullMarked;
+            public class Bar {
+              public static void bar1() {
+                // No report, unannotated caller!
+                Foo.foo(null);
+              }
+              @NullMarked
+              public static void bar2() {
+                // BUG: Diagnostic contains: passing @Nullable parameter
+                Foo.foo(null);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullMarkedConstructorsInUnmarkedClassesAnnotatedPackages() {
+    checkNullMarkedConstructors("-XepOpt:NullAway:AnnotatedPackages=com.uber", false);
+  }
+
+  @Test
+  public void nullMarkedConstructorsInUnmarkedClassesOnlyNullMarked() {
+    checkNullMarkedConstructors("-XepOpt:NullAway:OnlyNullMarked=true", false);
+  }
+
+  @Test
+  public void nullMarkedConstructorsInUnmarkedClassesAnnotatedPackagesJSpecifyMode() {
+    checkNullMarkedConstructors("-XepOpt:NullAway:AnnotatedPackages=com.uber", true);
+  }
+
+  @Test
+  public void nullMarkedConstructorsInUnmarkedClassesOnlyNullMarkedJSpecifyMode() {
+    checkNullMarkedConstructors("-XepOpt:NullAway:OnlyNullMarked=true", true);
+  }
+
+  /**
+   * Compiles the constructor regression cases under one nullness analysis configuration.
+   *
+   * @param scopeFlag the option selecting the nullness analysis scope
+   * @param jspecifyMode whether to enable JSpecify mode
+   */
+  private void checkNullMarkedConstructors(String scopeFlag, boolean jspecifyMode) {
+    List<String> args = List.of("-d", temporaryFolder.getRoot().getAbsolutePath(), scopeFlag);
+    if (jspecifyMode) {
+      args = JSpecifyJavacConfig.withJSpecifyModeArgs(args);
+    }
+    makeTestHelperWithArgs(args)
+        .addSourceLines(
+            "Foo.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.NullMarked;
+            import org.jspecify.annotations.Nullable;
+            public class Foo {
+              private final Object value;
+              @NullMarked
+              public Foo(Object value, @Nullable Object maybeNull) {
+                this.value = value;
+                this.value.toString();
+                this.check(value);
+                // BUG: Diagnostic contains: dereferenced expression 'maybeNull' is @Nullable
+                maybeNull.toString();
+              }
+              @NullMarked
+              public Foo() {
+                this(new Object(), null);
+              }
+              private void check(Object value) {}
+              @NullMarked
+              static class Marked {
+                private Object value;
+                Marked() {
+                  // BUG: Diagnostic contains: read of @NonNull field 'value' before
+                  value.toString();
+                  this.value = new Object();
+                }
+              }
+              enum UnmarkedEnum {
+                INSTANCE;
+                private final Object value;
+                @NullMarked
+                UnmarkedEnum() {
+                  this.value = new Object();
+                  value.toString();
+                }
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullMarkedOuterMethodLevelWithAnonymousClass() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.NullMarked;
+            public class Foo {
+              @NullMarked
+              public static String foo(String s) {
+                return s;
+              }
+            }
+            """)
+        .addSourceLines(
+            "Bar.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.NullMarked;
+            public class Bar {
+              @NullMarked
+              public static Runnable runFoo() {
+                return new Runnable() {
+                  public void run() {
+                    // BUG: Diagnostic contains: passing @Nullable parameter
+                    Foo.foo(null);
+                  }
+                };
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullMarkedOuterMethodLevelUsage() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "IConsumer.java",
+            """
+            package com.example.thirdparty;
+            public interface IConsumer {
+              void consume(Object s);
+            }
+            """)
+        .addSourceLines(
+            "Foo.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.NullMarked;
+            public class Foo {
+              @NullMarked
+              public static IConsumer getConsumer() {
+                return new IConsumer() {
+                  // Transitively null marked! Explicitly non-null arg, which is a safe override of unknown-nullness.
+                  public void consume(Object s) {
+                    System.out.println(s);
+                  }
+                };
+              }
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import com.example.thirdparty.Foo;
+            public class Test {
+              public static void test(Object o) {
+                // Safe because IConsumer::consume is unmarked? And no static knowledge of Foo$1
+                Foo.getConsumer().consume(null);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullMarkedOuterMethodLevelWithLocalClass() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.NullMarked;
+            public class Foo {
+              @NullMarked
+              public static String foo(String s) {
+                return s;
+              }
+            }
+            """)
+        .addSourceLines(
+            "Bar.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.NullMarked;
+            public class Bar {
+              @NullMarked
+              public static Object bar() {
+                class Baz {
+                  public void baz() {
+                    // BUG: Diagnostic contains: passing @Nullable parameter
+                    Foo.foo(null);
+                  }
+                }
+                Baz b = new Baz();
+                b.baz();
+                return b;
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullMarkedOuterMethodLevelWithLocalClassInit() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.NullMarked;
+            public class Test {
+              @NullMarked
+              public static Object test() {
+                class Foo {
+                  private Object o;
+                  // BUG: Diagnostic contains: initializer method does not guarantee @NonNull field 'o'
+                  public Foo() { }
+                  public String foo(String s) {
+                    return s;
+                  }
+                }
+                return new Foo();
+              }
+              public static Object test2() {
+                class Foo {
+                  private Object o; // No init checking, since Test$2Foo is unmarked.
+                  public Foo() { }
+                  @NullMarked
+                  public String foo(String s) {
+                    return s;
+                  }
+                }
+                return new Foo();
+              }
+              public static Object test3() {
+                class Foo {
+                  private Object o; // No init checking, since Test$2Foo is unmarked.
+                  public Foo() { }
+                  @NullMarked
+                  public String foo() {
+                    return o.toString();
+                  }
+                }
+                return new Foo();
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullMarkedLocalClassInAMethodOfAnUnmarkedLocalClass() {
+    checkNullMarkedClassSeesCapturedLocals(
+        """
+        class A {
+          void m() {
+            %s
+          }
+        }
+        """);
+  }
+
+  @Test
+  public void nullMarkedLocalClassInAMethodOfAnUnmarkedAnonymousClass() {
+    checkNullMarkedClassSeesCapturedLocals(
+        """
+        Runnable r = new Runnable() {
+          public void run() {
+            %s
+          }
+        };
+        """);
+  }
+
+  @Test
+  public void nullMarkedLocalClassInAnUnmarkedLambda() {
+    checkNullMarkedClassSeesCapturedLocals(
+        """
+        Runnable r = () -> {
+          %s
+        };
+        """);
+  }
+
+  @Test
+  public void nullMarkedLocalClassInAMethodOfAMemberOfAnUnmarkedLocalClass() {
+    checkNullMarkedClassSeesCapturedLocals(
+        """
+        class A {
+          class Member {
+            void m() {
+              %s
+            }
+          }
+        }
+        """);
+  }
+
+  @Test
+  public void nullMarkedLocalClassInAnInitializerOfAnUnmarkedLocalClass() {
+    checkNullMarkedClassSeesCapturedLocals(
+        """
+        class A {
+          {
+            %s
+          }
+        }
+        """);
+  }
+
+  @Test
+  public void nullMarkedLocalClassInsideTwoUnmarkedLocalClasses() {
+    checkNullMarkedClassSeesCapturedLocals(
+        """
+        class A {
+          void m() {
+            class Inner {
+              void n() {
+                %s
+              }
+            }
+          }
+        }
+        """);
+  }
+
+  @Test
+  public void nullMarkedMemberClassOfAnUnmarkedLocalClass() {
+    checkNullMarkedClassSeesCapturedLocals(
+        """
+        class A {
+          %s
+        }
+        """);
+  }
+
+  @Test
+  public void nullMarkedMemberClassOfAMemberOfAnUnmarkedLocalClass() {
+    checkNullMarkedClassSeesCapturedLocals(
+        """
+        class A {
+          class Member {
+            %s
+          }
+        }
+        """);
+  }
+
+  @Test
+  public void nullMarkedMemberClassOfAnUnmarkedAnonymousClass() {
+    checkNullMarkedClassSeesCapturedLocals(
+        """
+        Runnable r = new Runnable() {
+          %s
+          public void run() {}
+        };
+        """);
+  }
+
+  @Test
+  public void nullMarkedLocalClassInALambdaInAFieldInitializerOfAnUnmarkedLocalClass() {
+    checkNullMarkedClassSeesCapturedLocals(
+        """
+        class A {
+          Runnable r = () -> {
+            %s
+          };
+        }
+        """);
+  }
+
+  @Test
+  public void nullMarkedLocalClassInANullUnmarkedMethodOfAnAnnotatedPackage() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import org.jspecify.annotations.NullMarked;
+            import org.jspecify.annotations.NullUnmarked;
+            public class Test {
+              @NullUnmarked
+              public static void test() {
+                Object x = null;
+                class A {
+                  void m() {
+                    @NullMarked
+                    class Marked {
+                      Object get() {
+                        // BUG: Diagnostic contains: returning @Nullable expression
+                        return x;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullMarkedMethodOfAMemberClassOfAnUnmarkedLocalClass() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.NullMarked;
+            public class Test {
+              public static void test() {
+                Object x = null;
+                class A {
+                  class Member {
+                    @NullMarked
+                    Object get() {
+                      // BUG: Diagnostic contains: returning @Nullable expression
+                      return x;
+                    }
+                  }
+                }
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullMarkedMethodOfALocalClassInsideAnUnmarkedLocalClass() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.NullMarked;
+            public class Test {
+              public static void test() {
+                Object x = null;
+                class A {
+                  void m() {
+                    class Local {
+                      @NullMarked
+                      Object get() {
+                        // BUG: Diagnostic contains: returning @Nullable expression
+                        return x;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  /**
+   * Compiles a {@code @NullMarked} class declared in unmarked code inside an unmarked method, and
+   * checks that the class sees the nullness of the locals that method declares: returning the null
+   * local is reported, and returning the non-null one is not. A crash of NullAway fails the
+   * compilation instead.
+   *
+   * @param enclosingCode the unmarked code around the class, with {@code %s} where the class
+   *     declaration goes, as a local class or as a member of a class
+   */
+  private void checkNullMarkedClassSeesCapturedLocals(String enclosingCode) {
+    String markedClass =
+        """
+        @NullMarked
+        class Marked {
+          Object getNull() {
+            // BUG: Diagnostic contains: returning @Nullable expression
+            return x;
+          }
+          Object getNonNull() {
+            return y;
+          }
+        }
+        """;
+    defaultCompilationHelper
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.NullMarked;
+            public class Test {
+              public static void test() {
+                Object x = null;
+                Object y = new Object();
+                %s
+              }
+            }
+            """
+                .formatted(enclosingCode.formatted(markedClass)))
+        .doTest();
+  }
+
+  @Test
+  public void configUnannotatedOverridesNullMarked() {
+    makeTestHelperWithArgs(
+            Arrays.asList(
+                "-d",
+                temporaryFolder.getRoot().getAbsolutePath(),
+                "-XepOpt:NullAway:AnnotatedPackages=com.uber",
+                "-XepOpt:NullAway:UnannotatedSubPackages=com.example"))
+        .addSourceLines(
+            "package-info.java",
+            """
+            @NullMarked package com.example.thirdparty;
+            import org.jspecify.annotations.NullMarked;
+            """)
+        .addSourceLines(
+            "Foo.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.Nullable;
+            public class Foo {
+              public static String foo(String s) {
+                return s;
+              }
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import com.example.thirdparty.Foo;
+            public class Test {
+              public static void test(Object o) {
+                // Safe: Foo is treated as unannotated
+                Foo.foo(null);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void bytecodeNullMarkedPackageLevel() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import com.example.jspecify.annotatedpackage.Utils;
+            public class Test {
+              public static void test(Object o) {
+                // Safe: passing @NonNull on both args
+                Utils.toStringOrDefault(o, "default");
+                // Safe: first arg is @Nullable
+                Utils.toStringOrDefault(null, "default");
+                // Unsafe: @NullMarked means the second arg is @NonNull by default, not @Nullable
+                // BUG: Diagnostic contains: passing @Nullable parameter
+                Utils.toStringOrDefault(o, null);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void bytecodeNullMarkedClassLevel() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import com.example.jspecify.unannotatedpackage.TopLevel;
+            public class Test {
+              public static void test(Object o) {
+                // BUG: Diagnostic contains: passing @Nullable parameter
+                TopLevel.foo(null);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void bytecodeNullMarkedClassLevelInner() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import com.example.jspecify.unannotatedpackage.Outer;
+            public class Test {
+              public static void test(Object o) {
+                // BUG: Diagnostic contains: passing @Nullable parameter
+                Outer.Inner.foo(null);
+                Outer.unchecked(null);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void bytecodeNullMarkedMethodLevel() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import com.example.jspecify.unannotatedpackage.Methods;
+            public class Test {
+              public static void test(Object o) {
+                // BUG: Diagnostic contains: passing @Nullable parameter
+                Methods.foo(null);
+                Methods.unchecked(null);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void bytecodeNullMarkedMethodLevelOverriding() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import com.example.jspecify.unannotatedpackage.Methods;
+            import org.jspecify.annotations.Nullable;
+            public class Test extends Methods.ExtendMe {
+              @Nullable
+              // BUG: Diagnostic contains: method returns @Nullable, but superclass method
+              public Object foo(@Nullable Object o) { return o; }
+              @Nullable
+              public Object unchecked(@Nullable Object o) { return o; }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullUnmarkedPackageLevel() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "package-info.java",
+            """
+            @NullUnmarked package com.uber.unmarked;
+            import org.jspecify.annotations.NullUnmarked;
+            """)
+        .addSourceLines(
+            "MarkedBecauseAnnotatedFlag.java",
+            """
+            package com.uber.marked;
+            import org.jspecify.annotations.Nullable;
+            public class MarkedBecauseAnnotatedFlag {
+              public static String nullSafeStringOrDefault(@Nullable Object o1, String s) {
+                if (o1 != null) {
+                  return o1.toString();
+                }
+                return s;
+              }
+              @Nullable
+              public static String nullRet() {
+                return null;
+              }
+              public static String unsafeStringOrDefault(@Nullable Object o1, String s) {
+                // BUG: Diagnostic contains: dereferenced expression 'o1' is @Nullable
+                return o1.toString();
+              }
+            }
+            """)
+        .addSourceLines(
+            "UnmarkedBecausePackageDirectAnnotation.java",
+            """
+            package com.uber.unmarked;
+            import com.uber.marked.MarkedBecauseAnnotatedFlag;
+            import org.jspecify.annotations.Nullable;
+            public class UnmarkedBecausePackageDirectAnnotation {
+              public static String directlyUnsafeStringOrDefault(@Nullable Object o1, String s) {
+                // No error: unannotated
+                return o1.toString();
+              }
+              @Nullable
+              public static String nullRet() {
+                return null;
+              }
+              public static String indirectlyUnsafeStringOrDefault(@Nullable Object o1, String s) {
+                // No error: unannotated
+                return (o1 == null ? MarkedBecauseAnnotatedFlag.nullRet() : o1.toString());
+              }
+            }
+            """)
+        .addSourceLines(
+            "MarkedImplicitly.java",
+            """
+            package com.uber.unmarked.bar;
+            // Note: this package is annotated, because packages do not enclose each other for the purposes
+            // of @NullMarked/@NullUnmarked, see https://jspecify.dev/docs/spec#null-marked-scope
+            import com.uber.marked.MarkedBecauseAnnotatedFlag;
+            import com.uber.unmarked.UnmarkedBecausePackageDirectAnnotation;
+            import org.jspecify.annotations.Nullable;
+            public class MarkedImplicitly {
+              public static String directlyUnsafeStringOrDefault(@Nullable Object o1, String s) {
+                // BUG: Diagnostic contains: dereferenced expression 'o1' is @Nullable
+                return o1.toString();
+              }
+              public static String indirectlyUnsafeStringOrDefault(@Nullable Object o1, String s) {
+                // BUG: Diagnostic contains: returning @Nullable expression from method
+                return (o1 == null ? MarkedBecauseAnnotatedFlag.nullRet() : o1.toString());
+              }
+              public static String indirectlyUnsafeStringOrDefaultCallingUnmarked(@Nullable Object o1, String s) {
+                // No error: nullRet() is unannotated
+                return (o1 == null ? UnmarkedBecausePackageDirectAnnotation.nullRet() : o1.toString());
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullUnmarkedClassLevel() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "package-info.java",
+            """
+            @NullMarked package com.example.thirdparty.marked;
+            import org.jspecify.annotations.NullMarked;
+            """)
+        .addSourceLines(
+            "Foo.java",
+            """
+            package com.uber.foo;
+            import org.jspecify.annotations.NullUnmarked;
+            import org.jspecify.annotations.Nullable;
+            @NullUnmarked
+            public class Foo {
+              @Nullable
+              public static String nullRet() {
+                return null;
+              }
+              public static String takeNonNull(Object o) {
+                return o.toString();
+              }
+              public static String takeNullable(@Nullable Object o) {
+                return o.toString();
+              }
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import com.uber.foo.Foo;
+            public class Test {
+              public static Object test(Object o) {
+                // No errors, because Foo is @NullUnmarked
+                Foo.takeNonNull(null);
+                return Foo.nullRet();
+              }
+              public static String sanity() {
+                // BUG: Diagnostic contains: returning @Nullable expression
+                return null;
+              }
+            }
+            """)
+        // Note: unsafe to have two source files with the same path in the same test, so use Test2
+        .addSourceLines(
+            "Test2.java",
+            """
+            package com.example.thirdparty.marked;
+            import com.uber.foo.Foo;
+            public class Test2 {
+              public static Object test(Object o) {
+                // No errors, because Foo is @NullUnmarked
+                Foo.takeNonNull(null);
+                return Foo.nullRet();
+              }
+              public static String sanity() {
+                // BUG: Diagnostic contains: returning @Nullable expression
+                return null;
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullUnmarkedClassLevelOuter() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Bar.java",
+            """
+            package com.uber.foo;
+            import org.jspecify.annotations.NullUnmarked;
+            import org.jspecify.annotations.Nullable;
+            @NullUnmarked
+            public class Bar {
+              public static class Foo {
+                @Nullable
+                public static String nullRet() {
+                  return null;
+                }
+                public static String takeNonNull(Object o) {
+                  return o.toString();
+                }
+                public static String takeNullable(@Nullable Object o) {
+                  // No errors, because Foo is @NullUnmarked
+                  return o.toString();
+                }
+              }
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import com.uber.foo.Bar;
+            public class Test {
+              public static Object test(Object o) {
+                // No errors, because Foo is @NullUnmarked
+                Bar.Foo.takeNonNull(null);
+                return Bar.Foo.nullRet();
+              }
+              public static String sanity() {
+                // BUG: Diagnostic contains: returning @Nullable expression
+                return null;
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullUnmarkedMarkedClassLevelInner() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Bar.java",
+            """
+            package com.uber.foo;
+            import org.jspecify.annotations.NullUnmarked;
+            import org.jspecify.annotations.Nullable;
+            public class Bar {
+              @NullUnmarked
+              public static class Foo {
+                @Nullable
+                public static String nullRet() {
+                  return null;
+                }
+                public static String takeNonNull(Object o) {
+                  return o.toString();
+                }
+                public static String takeNullable(@Nullable Object o) {
+                  // No errors, because Foo is @NullUnmarked
+                  return o.toString();
+                }
+              }
+              // In marked outer class Bar
+              public static String sanity() {
+                // BUG: Diagnostic contains: returning @Nullable expression
+                return null;
+              }
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import com.uber.foo.Bar;
+            public class Test {
+              public static Object test(Object o) {
+                // No errors, because Foo is @NullUnmarked
+                Bar.Foo.takeNonNull(null);
+                return Bar.Foo.nullRet();
+              }
+              public static String sanity() {
+                // BUG: Diagnostic contains: returning @Nullable expression
+                return null;
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullUnmarkedClassLevelDeep() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Bar.java",
+            """
+            package com.uber.foo;
+            import org.jspecify.annotations.NullMarked;
+            import org.jspecify.annotations.NullUnmarked;
+            import org.jspecify.annotations.Nullable;
+            public class Bar {
+              @NullUnmarked
+              public static class Foo {
+                @NullMarked
+                public static class Deep {
+                  @Nullable
+                  public static String nullRet() {
+                    return null;
+                  }
+                  public static String takeNonNull(Object o) {
+                    return o.toString();
+                  }
+                  public static String takeNullable(@Nullable Object o) {
+                    // BUG: Diagnostic contains: dereferenced expression 'o' is @Nullable
+                    return o.toString();
+                  }
+                }
+                // In unmarked inner class Foo
+                public static String sanity() {
+                  // No errors, because Foo is @NullUnmarked,
+                  return null;
+                }
+              }
+              // In marked outer class Bar
+              public static String sanity() {
+                // BUG: Diagnostic contains: returning @Nullable expression
+                return null;
+              }
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import com.uber.foo.Bar;
+            public class Test {
+              public static void test(Object o) {
+                // BUG: Diagnostic contains: passing @Nullable parameter 'Bar.Foo.Deep.nullRet()'
+                Bar.Foo.Deep.takeNonNull(Bar.Foo.Deep.nullRet());
+              }
+              public static String sanity() {
+                // BUG: Diagnostic contains: returning @Nullable expression
+                return null;
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullUnmarkedMethodLevel() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            package com.uber;
+            import org.jspecify.annotations.NullUnmarked;
+            import org.jspecify.annotations.Nullable;
+            public class Foo {
+              @NullUnmarked
+              @Nullable
+              public static String callee(@Nullable Object o) {
+                // No error, since this code is unannotated
+                return o.toString();
+              }
+              public static String caller() {
+                // No error, since callee is unannotated
+                return callee(null);
+              }
+              public static String sanity() {
+                // BUG: Diagnostic contains: returning @Nullable expression
+                return null;
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullUnmarkedMethodWithNonNullParamJSpecifyMode() {
+    makeTestHelperWithArgs(
+            JSpecifyJavacConfig.withJSpecifyModeArgs(
+                Arrays.asList(
+                    "-d",
+                    temporaryFolder.getRoot().getAbsolutePath(),
+                    "-XepOpt:NullAway:OnlyNullMarked=true")))
+        .addSourceLines(
+            "Foo.java",
+            """
+            package com.uber;
+            import org.jspecify.annotations.NullUnmarked;
+            import org.jspecify.annotations.NullMarked;
+            import org.jspecify.annotations.NonNull;
+            @NullMarked
+            public class Foo {
+              @NullUnmarked
+              public static void callee(@NonNull Object o) {
+              }
+              @NullUnmarked
+              public static void callee2(Object o) {
+              }
+              public static void caller() {
+                // Error due to explicit @NonNull annotation
+                // BUG: Diagnostic contains: passing @Nullable parameter
+                callee(null);
+                // this is fine
+                callee2(null);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullUnmarkedMethodWithNullableReturnJSpecifyMode() {
+    makeTestHelperWithArgs(
+            JSpecifyJavacConfig.withJSpecifyModeArgs(
+                Arrays.asList(
+                    "-d",
+                    temporaryFolder.getRoot().getAbsolutePath(),
+                    "-XepOpt:NullAway:OnlyNullMarked=true")))
+        .addSourceLines(
+            "Foo.java",
+            """
+            package com.uber;
+            import org.jspecify.annotations.NullUnmarked;
+            import org.jspecify.annotations.NullMarked;
+            import org.jspecify.annotations.Nullable;
+            @NullMarked
+            public class Foo {
+              @NullUnmarked
+              public static @Nullable String callee() {
+                return null;
+              }
+              public static void caller() {
+                // Error due to explicit @Nullable annotation
+                // BUG: Diagnostic contains: dereferenced expression 'callee()' is @Nullable
+                callee().toString();
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void explicitlyTypedLambdaOverNullUnmarkedMethodWithNullableParamJSpecifyMode() {
+    makeTestHelperWithArgs(
+            JSpecifyJavacConfig.withJSpecifyModeArgs(
+                Arrays.asList(
+                    "-d",
+                    temporaryFolder.getRoot().getAbsolutePath(),
+                    "-XepOpt:NullAway:OnlyNullMarked=true")))
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import org.jspecify.annotations.NullMarked;
+            import org.jspecify.annotations.NullUnmarked;
+            import org.jspecify.annotations.Nullable;
+            @NullMarked
+            class Test {
+              interface NullableParamFi {
+                @NullUnmarked
+                void apply(@Nullable Object o);
+              }
+              interface UnannotatedParamFi {
+                @NullUnmarked
+                void apply(Object o);
+              }
+              void test() {
+                // BUG: Diagnostic contains: parameter o is @NonNull, but parameter in functional interface method com.uber.Test.NullableParamFi.apply(@Nullable Object) is @Nullable
+                NullableParamFi nonNullParam = (Object o) -> {};
+                NullableParamFi nullableParam = (@Nullable Object o) -> {};
+                UnannotatedParamFi unannotatedFiParam = (Object o) -> {};
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullUnmarkedOuterMethodLevelWithLocalClass() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Bar.java",
+            """
+            package com.example.thirdparty;
+            import org.jspecify.annotations.NullMarked;
+            import org.jspecify.annotations.NullUnmarked;
+            @NullMarked
+            public class Bar {
+              public static String takeNonNull(Object o) {
+                return o.toString();
+              }
+              @NullUnmarked
+              public static Object bar1() {
+                class Baz {
+                  public void baz() {
+                    // No error, unmarked code
+                    Bar.takeNonNull(null);
+                  }
+                }
+                Baz b = new Baz();
+                b.baz();
+                return b;
+              }
+              @NullUnmarked
+              public static Object bar2() {
+                @NullMarked
+                class Baz {
+                  public void baz() {
+                    // BUG: Diagnostic contains: passing @Nullable parameter
+                    Bar.takeNonNull(null);
+                  }
+                }
+                Baz b = new Baz();
+                b.baz();
+                return b;
+              }
+              @NullUnmarked
+              public static Object bar3() {
+                class Baz {
+                  @NullMarked
+                  public void baz() {
+                    // BUG: Diagnostic contains: passing @Nullable parameter
+                    Bar.takeNonNull(null);
+                  }
+                }
+                Baz b = new Baz();
+                b.baz();
+                return b;
+              }
+              public static String sanity() {
+                // BUG: Diagnostic contains: returning @Nullable expression
+                return null;
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void bytecodeNullUnmarkedMethodLevel() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import com.example.jspecify.unannotatedpackage.Methods;
+            public class Test {
+              public static void test(Object o) {
+                // BUG: Diagnostic contains: passing @Nullable parameter
+                Methods.Marked.foo(null);
+                Methods.Marked.unchecked(null);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullUnmarkedAndAcknowledgeRestrictiveAnnotations() {
+    makeTestHelperWithArgs(
+            Arrays.asList(
+                "-d",
+                temporaryFolder.getRoot().getAbsolutePath(),
+                // Flag is required for now, but might no longer be need with @NullMarked!
+                "-XepOpt:NullAway:AnnotatedPackages=com.uber.dontcare",
+                "-XepOpt:NullAway:AcknowledgeRestrictiveAnnotations=true"))
+        .addSourceLines(
+            "Foo.java",
+            """
+            package com.uber;
+            import org.jspecify.annotations.NullMarked;
+            import org.jspecify.annotations.NullUnmarked;
+            import org.jspecify.annotations.Nullable;
+            @NullUnmarked
+            public class Foo {
+              // No initialization warning, Foo is unmarked
+              @Nullable public Object f;
+              @Nullable
+              public String callee(@Nullable Object o) {
+                // No error, since this code is unannotated
+                return o.toString() + f.toString();
+              }
+              @NullMarked
+              public String caller() {
+                // Error, since callee still has restrictive annotations!
+                // BUG: Diagnostic contains: returning @Nullable expression from method
+                return callee(null);
+              }
+              @NullMarked
+              public Object getF() {
+                // Error, since callee still has restrictive annotations!
+                // BUG: Diagnostic contains: returning @Nullable expression from method
+                return f;
+              }
+              @NullMarked
+              public String derefUnmarkedField() {
+                // Error, since callee still has restrictive annotations!
+                // BUG: Diagnostic contains: dereferenced expression 'f' is @Nullable
+                return f.toString();
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullUnmarkedRestrictiveAnnotationsAndGenerics() {
+    makeTestHelperWithArgs(
+            Arrays.asList(
+                "-d",
+                temporaryFolder.getRoot().getAbsolutePath(),
+                "-XepOpt:NullAway:AnnotatedPackages=com.uber",
+                "-XepOpt:NullAway:AcknowledgeRestrictiveAnnotations=true"))
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import org.jspecify.annotations.NullUnmarked;
+            import org.jetbrains.annotations.Nullable;
+            import org.jetbrains.annotations.NotNull;
+            import java.util.List;
+            public class Test {
+              @NullUnmarked
+              public static void takesNullable(@Nullable List<@NotNull String> l) {}
+              public static void test() {
+                takesNullable(null);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullMarkedStaticImports() {
+    makeTestHelperWithArgs(
+            Arrays.asList(
+                "-d",
+                temporaryFolder.getRoot().getAbsolutePath(),
+                // Flag is required for now, but might no longer be need with @NullMarked!
+                "-XepOpt:NullAway:AnnotatedPackages=com.uber.dontcare",
+                "-XepOpt:NullAway:AcknowledgeRestrictiveAnnotations=true"))
+        .addSourceLines(
+            "StaticMethods.java",
+            """
+            package com.uber;
+            import org.jspecify.annotations.NullMarked;
+            import org.jspecify.annotations.Nullable;
+            public final class StaticMethods {
+              private StaticMethods() {}
+              @NullMarked
+              public static Object nonNullCallee(Object o) {
+                return o;
+              }
+              @NullMarked
+              @Nullable
+              public static Object nullableCallee(@Nullable Object o) {
+                return o;
+              }
+              public static Object unmarkedCallee(@Nullable Object o) {
+                // no error, because unmarked
+                return o;
+              }
+              @Nullable
+              public static Object unmarkedNullableCallee(@Nullable Object o) {
+                return o;
+              }
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import static com.uber.StaticMethods.nonNullCallee;
+            import static com.uber.StaticMethods.nullableCallee;
+            import static com.uber.StaticMethods.unmarkedCallee;
+            import static com.uber.StaticMethods.unmarkedNullableCallee;
+            import org.jspecify.annotations.NullMarked;
+            import org.jspecify.annotations.Nullable;
+            @NullMarked
+            public class Test {
+              public Object getNewObject() {
+                return new Object();
+              }
+              public void test() {
+                Object o = getNewObject();
+                nonNullCallee(o).toString();
+                // BUG: Diagnostic contains: dereferenced expression 'nullableCallee(o)' is @Nullable
+                nullableCallee(o).toString();
+                unmarkedCallee(o).toString();
+                // BUG: Diagnostic contains: dereferenced expression 'unmarkedNullableCallee(o)' is @Nullable
+                unmarkedNullableCallee(o).toString();
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void dotClassSanityTest1() {
+    // Check that we do not crash while determining the nullmarked-ness of primitive.class (e.g.
+    // int.class)
+    makeTestHelperWithArgs(
+            Arrays.asList(
+                "-d",
+                temporaryFolder.getRoot().getAbsolutePath(),
+                // Flag is required for now, but might no longer be need with @NullMarked!
+                "-XepOpt:NullAway:AnnotatedPackages=com.uber.dontcare",
+                "-XepOpt:NullAway:AcknowledgeRestrictiveAnnotations=true"))
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import org.jspecify.annotations.NullMarked;
+            import org.jspecify.annotations.Nullable;
+            import java.lang.reflect.Field;
+            @NullMarked
+            public class Test {
+              public void takesClass(Class c) {
+              }
+              public Object test(boolean flag) {
+                takesClass(Test.class);
+                takesClass(String.class);
+                takesClass(int.class);
+                takesClass(boolean.class);
+                takesClass(float.class);
+                takesClass(void.class);
+                // NEEDED TO TRIGGER DATAFLOW:
+                return flag ? Test.class : new Object();
+              }
+              public boolean test2(Field field) {
+                if (field.getType() == int.class || field.getType() == Integer.class) {
+                  return true;
+                }
+                return false;
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void dotClassSanityTest2() {
+    // Check that we do not crash while determining the nullmarked-ness of primitive.class (e.g.
+    // int.class)
+    makeTestHelperWithArgs(
+            Arrays.asList(
+                "-d",
+                temporaryFolder.getRoot().getAbsolutePath(),
+                // Flag is required for now, but might no longer be need with @NullMarked!
+                "-XepOpt:NullAway:AnnotatedPackages=com.uber.dontcare",
+                "-XepOpt:NullAway:AcknowledgeRestrictiveAnnotations=true",
+                "-XepOpt:NullAway:TreatGeneratedAsUnannotated=true"))
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import org.jspecify.annotations.NullMarked;
+            import org.jspecify.annotations.Nullable;
+            import java.lang.reflect.Field;
+            @NullMarked
+            public class Test {
+              public void takesClass(Class c) {
+              }
+              public Object test(boolean flag) {
+                takesClass(Test.class);
+                takesClass(String.class);
+                takesClass(int.class);
+                takesClass(boolean.class);
+                takesClass(float.class);
+                takesClass(void.class);
+                // NEEDED TO TRIGGER DATAFLOW:
+                return flag ? Test.class : new Object();
+              }
+              public boolean test2(Field field) {
+                if (field.getType() == int.class || field.getType() == Integer.class) {
+                  return true;
+                }
+                return false;
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void nullUnmarkedOnConstructorSuppressesInitializerWarnings() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Foo.java",
+            """
+            package com.uber;
+            import org.jspecify.annotations.NullUnmarked;
+            import org.jspecify.annotations.Nullable;
+            public class Foo {
+              public Object f;
+              @NullUnmarked
+              // No error, because Foo is unmarked
+              public Foo() { }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void writeToNullUnmarkedField() {
+    defaultCompilationHelper
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.unannotated;
+            import org.jspecify.annotations.NullMarked;
+            public class Test {
+                static Object foo;
+                @NullMarked
+                static class Inner {
+                    String bar() {
+                        // expecting no errors since foo is in @NullUnmarked code
+                        foo = null;
+                        return foo.toString();
+                    }
+                }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void methodRefToNullUnmarkedNoAcknowledgeRestrictive() {
+    makeTestHelperWithArgs(
+            Arrays.asList(
+                "-d",
+                temporaryFolder.getRoot().getAbsolutePath(),
+                "-XepOpt:NullAway:AnnotatedPackages=com.uber"))
+        .addSourceLines(
+            "Test.java",
+            """
+            import org.jspecify.annotations.*;
+            @NullMarked
+            class Test {
+              interface I {
+                void m(@Nullable Object o);
+              }
+              @NullUnmarked
+              void unmarkedParam(Object o) {}
+              @NullUnmarked
+              void nonNullParam(@NonNull Object o) {}
+              void test() {
+                I i = this::unmarkedParam;
+                // no error since we don't acknowledge restrictive annotations
+                I i2 = this::nonNullParam;
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void castToNonNullWithNullUnmarkedPackage() {
+    makeTestHelperWithArgs(
+            Arrays.asList(
+                "-d",
+                temporaryFolder.getRoot().getAbsolutePath(),
+                "-XepOpt:NullAway:AnnotatedPackages=com.uber",
+                "-XepOpt:NullAway:CastToNonNullMethod=com.uber.nullaway.testdata.Util.castToNonNull"))
+        .addSourceLines("Util.java", UTIL_SOURCE)
+        .addSourceLines(
+            "package-info.java",
+            """
+            @NullUnmarked package com.example.thirdparty;
+            import org.jspecify.annotations.NullUnmarked;
+            """)
+        .addSourceLines(
+            "ThirdPartyUtils.java",
+            """
+            package com.example.thirdparty;
+            public class ThirdPartyUtils {
+              public static String getStringValue() {
+                return "some value";
+              }
+              public static String maybeNull() {
+                return Math.random() > 0.5 ? "value" : null;
+              }
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import static com.uber.nullaway.testdata.Util.castToNonNull;
+            import com.example.thirdparty.ThirdPartyUtils;
+            public class Test {
+              public static void test() {
+                // This should NOT produce a warning since the return value from
+                // @NullUnmarked code has unknown nullness
+                String val1 = castToNonNull(ThirdPartyUtils.getStringValue());
+                String val2 = castToNonNull(ThirdPartyUtils.maybeNull());
+                System.out.println(val1 + val2);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void indirectCastToNonNullFromNullUnmarkedPackageWarns() {
+    makeTestHelperWithArgs(
+            Arrays.asList(
+                "-d",
+                temporaryFolder.getRoot().getAbsolutePath(),
+                "-XepOpt:NullAway:AnnotatedPackages=com.uber",
+                "-XepOpt:NullAway:CastToNonNullMethod=com.uber.nullaway.testdata.Util.castToNonNull"))
+        .addSourceLines("Util.java", UTIL_SOURCE)
+        .addSourceLines(
+            "package-info.java",
+            """
+            @NullUnmarked package com.example.thirdparty;
+            import org.jspecify.annotations.NullUnmarked;
+            """)
+        .addSourceLines(
+            "ThirdPartyUtils.java",
+            """
+            package com.example.thirdparty;
+            public class ThirdPartyUtils {
+              public static String getStringValue() {
+                return "some value";
+              }
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import static com.uber.nullaway.testdata.Util.castToNonNull;
+            import com.example.thirdparty.ThirdPartyUtils;
+            public class Test {
+              public static void test() {
+                String s = ThirdPartyUtils.getStringValue();
+                // Now not an immediate wrapper around the unmarked call; should warn:
+                // BUG: Diagnostic contains: passing known @NonNull parameter
+                String val = castToNonNull(s);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void castToNonNullWithNullUnmarkedClass() {
+    makeTestHelperWithArgs(
+            Arrays.asList(
+                "-d",
+                temporaryFolder.getRoot().getAbsolutePath(),
+                "-XepOpt:NullAway:AnnotatedPackages=com.uber",
+                "-XepOpt:NullAway:CastToNonNullMethod=com.uber.nullaway.testdata.Util.castToNonNull"))
+        .addSourceLines("Util.java", UTIL_SOURCE)
+        .addSourceLines(
+            "ThirdPartyUtils.java",
+            """
+            package com.uber;
+            import org.jspecify.annotations.NullUnmarked;
+            @NullUnmarked
+            public class ThirdPartyUtils {
+              public static String getStringValue() {
+                return "some value";
+              }
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import static com.uber.nullaway.testdata.Util.castToNonNull;
+            public class Test {
+              public static void test() {
+                // This should NOT produce a warning since the return value from
+                // @NullUnmarked code has unknown nullness
+                String val = castToNonNull(ThirdPartyUtils.getStringValue());
+                System.out.println(val);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void castToNonNullWithParenthesizedNullUnmarkedExpressions() {
+    makeTestHelperWithArgs(
+            Arrays.asList(
+                "-d",
+                temporaryFolder.getRoot().getAbsolutePath(),
+                "-XepOpt:NullAway:AnnotatedPackages=com.uber",
+                "-XepOpt:NullAway:CastToNonNullMethod=com.uber.nullaway.testdata.Util.castToNonNull"))
+        .addSourceLines("Util.java", UTIL_SOURCE)
+        .addSourceLines(
+            "ThirdPartyUtils.java",
+            """
+            package com.uber;
+            import org.jspecify.annotations.NullUnmarked;
+            @NullUnmarked
+            public class ThirdPartyUtils {
+              public static String getStringValue() {
+                return "x";
+              }
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import static com.uber.nullaway.testdata.Util.castToNonNull;
+            public class Test {
+              public static void test() {
+                String a = castToNonNull((ThirdPartyUtils.getStringValue()));
+                String b = castToNonNull((String) (ThirdPartyUtils.getStringValue()));
+                System.out.println(a + b);
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void castToNonNullWithNullUnmarkedMethod() {
+    makeTestHelperWithArgs(
+            Arrays.asList(
+                "-d",
+                temporaryFolder.getRoot().getAbsolutePath(),
+                "-XepOpt:NullAway:AnnotatedPackages=com.uber",
+                "-XepOpt:NullAway:CastToNonNullMethod=com.uber.nullaway.testdata.Util.castToNonNull"))
+        .addSourceLines("Util.java", UTIL_SOURCE)
+        .addSourceLines(
+            "ThirdPartyUtils.java",
+            """
+            package com.uber;
+            import org.jspecify.annotations.NullUnmarked;
+            public class ThirdPartyUtils {
+              @NullUnmarked
+              public static String getStringValue() {
+                return "some value";
+              }
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import static com.uber.nullaway.testdata.Util.castToNonNull;
+            public class Test {
+              public static void test() {
+                // This should NOT produce a warning since the return value from
+                // @NullUnmarked code has unknown nullness
+                String val = castToNonNull(ThirdPartyUtils.getStringValue());
+                System.out.println(val);
+              }
+            }
+            """)
+        .doTest();
+  }
+}

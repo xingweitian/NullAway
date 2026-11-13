@@ -21,30 +21,35 @@
  */
 package com.uber.nullaway.handlers;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableSet;
 import com.google.errorprone.VisitorState;
 import com.google.errorprone.util.ASTHelpers;
-import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ExpressionTree;
-import com.sun.source.tree.Tree;
+import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.util.TreePath;
 import com.sun.tools.javac.code.Symbol;
+import com.sun.tools.javac.code.Symtab;
 import com.sun.tools.javac.code.Type;
 import com.sun.tools.javac.code.Types;
 import com.sun.tools.javac.util.Context;
+import com.sun.tools.javac.util.Names;
 import com.uber.nullaway.Config;
 import com.uber.nullaway.ErrorMessage;
 import com.uber.nullaway.NullAway;
+import com.uber.nullaway.NullabilityUtil;
 import com.uber.nullaway.Nullness;
 import com.uber.nullaway.dataflow.AccessPath;
 import com.uber.nullaway.dataflow.AccessPathNullnessAnalysis;
 import com.uber.nullaway.dataflow.AccessPathNullnessPropagation;
 import java.lang.annotation.Annotation;
+import java.lang.reflect.Array;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
-import javax.annotation.Nullable;
+import java.util.function.Consumer;
 import javax.lang.model.element.AnnotationMirror;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
@@ -52,23 +57,23 @@ import javax.lang.model.element.ElementVisitor;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.Name;
 import javax.lang.model.element.VariableElement;
+import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
 import org.checkerframework.nullaway.dataflow.cfg.node.MethodInvocationNode;
 import org.checkerframework.nullaway.dataflow.cfg.node.Node;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Handler to better handle {@code isPresent()} methods in code generated for Optionals. With this
  * handler, we learn appropriate Emptiness facts about the relevant property from these calls.
  */
-public class OptionalEmptinessHandler extends BaseNoOpHandler {
+public class OptionalEmptinessHandler implements Handler {
 
-  @Nullable private ImmutableSet<Type> optionalTypes;
-  private NullAway analysis;
+  private @Nullable ImmutableSet<Type> optionalTypes;
+  private @Nullable NullAway analysis;
 
   private final Config config;
   private final MethodNameUtil methodNameUtil;
-
-  public static final VariableElement OPTIONAL_CONTENT = getOptionalContentElement();
 
   OptionalEmptinessHandler(Config config, MethodNameUtil methodNameUtil) {
     this.config = config;
@@ -77,47 +82,57 @@ public class OptionalEmptinessHandler extends BaseNoOpHandler {
 
   @Override
   public boolean onOverrideMayBeNullExpr(
-      NullAway analysis, ExpressionTree expr, VisitorState state, boolean exprMayBeNull) {
-    if (expr.getKind() == Tree.Kind.METHOD_INVOCATION
-        && optionalIsGetCall((Symbol.MethodSymbol) ASTHelpers.getSymbol(expr), state.getTypes())) {
+      NullAway analysis,
+      ExpressionTree expr,
+      @Nullable Symbol exprSymbol,
+      VisitorState state,
+      boolean exprMayBeNull) {
+    if (exprMayBeNull) {
       return true;
     }
-    return exprMayBeNull;
+    if (expr instanceof MethodInvocationTree
+        && exprSymbol instanceof Symbol.MethodSymbol methodSymbol
+        && optionalIsGetCall(methodSymbol, state.getTypes())) {
+      return true;
+    }
+    return false;
   }
 
   @Override
-  public void onMatchTopLevelClass(
-      NullAway analysis, ClassTree tree, VisitorState state, Symbol.ClassSymbol classSymbol) {
+  public void onMatchCompilationUnit(
+      NullAway analysis, CompilationUnitTree tree, VisitorState state) {
 
     this.analysis = analysis;
 
-    optionalTypes =
-        config
-            .getOptionalClassPaths()
-            .stream()
-            .map(state::getTypeFromString)
-            .filter(Objects::nonNull)
-            .map(state.getTypes()::erasure)
-            .collect(ImmutableSet.toImmutableSet());
+    if (optionalTypes == null) {
+      optionalTypes =
+          config.getOptionalClassPaths().stream()
+              .map(state::getTypeFromString)
+              .filter(Objects::nonNull)
+              .map(state.getTypes()::erasure)
+              .collect(ImmutableSet.toImmutableSet());
+    }
   }
 
   @Override
   public NullnessHint onDataflowVisitMethodInvocation(
       MethodInvocationNode node,
-      Types types,
-      Context context,
+      Symbol.MethodSymbol symbol,
+      VisitorState state,
       AccessPath.AccessPathContext apContext,
       AccessPathNullnessPropagation.SubNodeValues inputs,
       AccessPathNullnessPropagation.Updates thenUpdates,
       AccessPathNullnessPropagation.Updates elseUpdates,
       AccessPathNullnessPropagation.Updates bothUpdates) {
-    Symbol.MethodSymbol symbol = ASTHelpers.getSymbol(node.getTree());
-
+    Types types = state.getTypes();
     if (optionalIsPresentCall(symbol, types)) {
-      updateNonNullAPsForOptionalContent(thenUpdates, node.getTarget().getReceiver(), apContext);
-    } else if (config.handleTestAssertionLibraries() && methodNameUtil.isMethodIsTrue(symbol)) {
-      // we check for instance of AssertThat(optionalFoo.isPresent()).isTrue()
-      updateIfAssertIsPresentTrueOnOptional(node, types, apContext, bothUpdates);
+      updateNonNullAPsForOptionalContent(
+          state.context, thenUpdates, node.getTarget().getReceiver(), apContext);
+    } else if (optionalIsEmptyCall(symbol, types)) {
+      updateNonNullAPsForOptionalContent(
+          state.context, elseUpdates, node.getTarget().getReceiver(), apContext);
+    } else if (config.handleTestAssertionLibraries()) {
+      handleTestAssertions(state, apContext, bothUpdates, node, symbol);
     }
     return NullnessHint.UNKNOWN;
   }
@@ -125,11 +140,12 @@ public class OptionalEmptinessHandler extends BaseNoOpHandler {
   @Override
   public Optional<ErrorMessage> onExpressionDereference(
       ExpressionTree expr, ExpressionTree baseExpr, VisitorState state) {
-
-    if (ASTHelpers.getSymbol(expr) instanceof Symbol.MethodSymbol
-        && optionalIsGetCall((Symbol.MethodSymbol) ASTHelpers.getSymbol(expr), state.getTypes())
+    Preconditions.checkNotNull(analysis);
+    Symbol symbol = ASTHelpers.getSymbol(expr);
+    if (symbol instanceof Symbol.MethodSymbol methodSymbol
+        && optionalIsGetCall(methodSymbol, state.getTypes())
         && isOptionalContentNullable(state, baseExpr, analysis.getNullnessAnalysis(state))) {
-      final String message = "Invoking get() on possibly empty Optional " + baseExpr;
+      String message = "Invoking get() on possibly empty Optional " + baseExpr;
       return Optional.of(
           new ErrorMessage(ErrorMessage.MessageTypes.GET_ON_EMPTY_OPTIONAL, message));
     }
@@ -137,145 +153,236 @@ public class OptionalEmptinessHandler extends BaseNoOpHandler {
   }
 
   private boolean isOptionalContentNullable(
-      VisitorState state, ExpressionTree baseExpr, AccessPathNullnessAnalysis analysis) {
-    return analysis.getNullnessOfExpressionNamedField(
-            new TreePath(state.getPath(), baseExpr), state.context, OPTIONAL_CONTENT)
-        == Nullness.NULLABLE;
+      VisitorState state,
+      ExpressionTree baseExpr,
+      AccessPathNullnessAnalysis accessPathNullnessAnalysis) {
+    return NullabilityUtil.nullnessToBool(
+        accessPathNullnessAnalysis.getNullnessOfExpressionNamedField(
+            new TreePath(state.getPath(), baseExpr),
+            state.context,
+            OptionalContentVariableElement.instance(state.context)));
   }
 
-  @Override
-  public boolean includeApInfoInSavedContext(AccessPath accessPath, VisitorState state) {
-
-    if (accessPath.getElements().size() == 1) {
-      AccessPath.Root root = accessPath.getRoot();
-      if (!root.isReceiver()) {
-        final Element e = root.getVarElement();
-        return e.getKind().equals(ElementKind.LOCAL_VARIABLE)
-            && accessPath.getElements().get(0).getJavaElement().equals(OPTIONAL_CONTENT);
-      }
-    }
-    return false;
-  }
-
-  private void updateIfAssertIsPresentTrueOnOptional(
-      MethodInvocationNode node,
-      Types types,
+  private void handleTestAssertions(
+      VisitorState state,
       AccessPath.AccessPathContext apContext,
-      AccessPathNullnessPropagation.Updates bothUpdates) {
+      AccessPathNullnessPropagation.Updates bothUpdates,
+      MethodInvocationNode node,
+      Symbol.MethodSymbol symbol) {
+
+    Consumer<Node> nonNullMarker =
+        nonNullNode ->
+            updateNonNullAPsForOptionalContent(state.context, bothUpdates, nonNullNode, apContext);
+
+    boolean isAssertTrueMethod = methodNameUtil.isMethodAssertTrue(symbol);
+    boolean isAssertFalseMethod = methodNameUtil.isMethodAssertFalse(symbol);
+    boolean isTrueMethod = methodNameUtil.isMethodIsTrue(symbol);
+    boolean isFalseMethod = methodNameUtil.isMethodIsFalse(symbol);
+    if (isAssertTrueMethod || isAssertFalseMethod) {
+      // assertTrue(optionalFoo.isPresent())
+      // assertFalse("optional was empty", optionalFoo.isEmpty())
+      // note: in junit4 the optional string message comes first, but in junit5 it comes last
+      Optional<MethodInvocationNode> assertedOnMethod =
+          node.getArguments().stream()
+              .filter(n -> TypeKind.BOOLEAN.equals(n.getType().getKind()))
+              .filter(n -> n instanceof MethodInvocationNode)
+              .map(n -> (MethodInvocationNode) n)
+              .findFirst();
+      if (assertedOnMethod.isPresent()) {
+        handleBooleanAssertionOnMethod(
+            nonNullMarker,
+            state.getTypes(),
+            assertedOnMethod.get(),
+            isAssertTrueMethod,
+            isAssertFalseMethod);
+      }
+    } else if (isTrueMethod || isFalseMethod) {
+      // asertThat(optionalFoo.isPresent()).isTrue()
+      // asertThat(optionalFoo.isEmpty()).isFalse()
+      Optional<MethodInvocationNode> wrappedMethod =
+          getNodeWrappedByAssertThat(node)
+              .filter(n -> n instanceof MethodInvocationNode)
+              .map(n -> (MethodInvocationNode) n)
+              .map(this::maybeUnwrapBooleanValueOf);
+      if (wrappedMethod.isPresent()) {
+        handleBooleanAssertionOnMethod(
+            nonNullMarker, state.getTypes(), wrappedMethod.get(), isTrueMethod, isFalseMethod);
+      }
+    } else if (methodNameUtil.isMethodThatEnsuresOptionalPresent(symbol)) {
+      // assertThat(optionalRef).isPresent()
+      // assertThat(methodReturningOptional()).isNotEmpty()
+      // assertThat(mapWithOptionalValues.get("key")).isNotEmpty()
+      getNodeWrappedByAssertThat(node).ifPresent(nonNullMarker);
+    }
+  }
+
+  private void handleBooleanAssertionOnMethod(
+      Consumer<Node> nonNullMarker,
+      Types types,
+      MethodInvocationNode node,
+      boolean assertsTrue,
+      boolean assertsFalse) {
+    Symbol.MethodSymbol methodSymbol = ASTHelpers.getSymbol(node.getTree());
+    boolean ensuresIsPresent = assertsTrue && optionalIsPresentCall(methodSymbol, types);
+    boolean ensuresNotEmpty = assertsFalse && optionalIsEmptyCall(methodSymbol, types);
+    if (ensuresIsPresent || ensuresNotEmpty) {
+      nonNullMarker.accept(node.getTarget().getReceiver());
+    }
+  }
+
+  private Optional<Node> getNodeWrappedByAssertThat(MethodInvocationNode node) {
     Node receiver = node.getTarget().getReceiver();
-    if (receiver instanceof MethodInvocationNode) {
-      MethodInvocationNode receiverMethod = (MethodInvocationNode) receiver;
-      Symbol.MethodSymbol receiverSymbol = ASTHelpers.getSymbol(receiverMethod.getTree());
-      if (methodNameUtil.isMethodAssertThat(receiverSymbol)) {
-        // assertThat will always have at least one argument, So safe to extract from the arguments
-        Node arg = receiverMethod.getArgument(0);
-        if (arg instanceof MethodInvocationNode) {
-          // Since assertThat(a.isPresent()) changes to
-          // Truth.assertThat(Boolean.valueOf(a.isPresent()))
-          // need to be unwrapped from Boolean.valueOf
-          Node unwrappedArg = ((MethodInvocationNode) arg).getArgument(0);
-          if (unwrappedArg instanceof MethodInvocationNode) {
-            MethodInvocationNode argMethod = (MethodInvocationNode) unwrappedArg;
-            Symbol.MethodSymbol argSymbol = ASTHelpers.getSymbol(argMethod.getTree());
-            if (optionalIsPresentCall(argSymbol, types)) {
-              updateNonNullAPsForOptionalContent(
-                  bothUpdates, argMethod.getTarget().getReceiver(), apContext);
-            }
-          }
+    if (receiver instanceof MethodInvocationNode receiverMethod) {
+      if (receiverMethod.getArguments().size() == 1) {
+        Symbol.MethodSymbol receiverSymbol = ASTHelpers.getSymbol(receiverMethod.getTree());
+        if (methodNameUtil.isMethodAssertThat(receiverSymbol)) {
+          return Optional.of(receiverMethod.getArgument(0));
         }
       }
     }
+    return Optional.empty();
+  }
+
+  private MethodInvocationNode maybeUnwrapBooleanValueOf(MethodInvocationNode node) {
+    // Due to autoboxing in the java compiler
+    // Truth.assertThat(a.isPresent()) changes to
+    // Truth.assertThat(Boolean.valueOf(a.isPresent()))
+    // and we need to unwrap Boolean.valueOf here
+    if (node.getArguments().size() == 1) {
+      Symbol.MethodSymbol symbol = ASTHelpers.getSymbol(node.getTree());
+      if (methodNameUtil.isMethodBooleanValueOf(symbol)) {
+        Node unwrappedArg = node.getArgument(0);
+        if (unwrappedArg instanceof MethodInvocationNode methodInvocationNode) {
+          return methodInvocationNode;
+        }
+      }
+    }
+    return node;
   }
 
   private void updateNonNullAPsForOptionalContent(
+      Context context,
       AccessPathNullnessPropagation.Updates updates,
       Node base,
       AccessPath.AccessPathContext apContext) {
-    AccessPath ap = AccessPath.fromBaseAndElement(base, OPTIONAL_CONTENT, apContext);
+    AccessPath ap =
+        AccessPath.fromBaseAndElement(
+            base, OptionalContentVariableElement.instance(context), apContext);
     if (ap != null && base.getTree() != null) {
       updates.set(ap, Nullness.NONNULL);
     }
   }
 
   private boolean optionalIsPresentCall(Symbol.MethodSymbol symbol, Types types) {
+    return isZeroArgOptionalMethod("isPresent", symbol, types);
+  }
+
+  private boolean optionalIsEmptyCall(Symbol.MethodSymbol symbol, Types types) {
+    return isZeroArgOptionalMethod("isEmpty", symbol, types);
+  }
+
+  private boolean isZeroArgOptionalMethod(
+      String methodName, Symbol.MethodSymbol symbol, Types types) {
+    Preconditions.checkNotNull(optionalTypes);
+    if (!(symbol.getSimpleName().toString().equals(methodName)
+        && symbol.getParameters().length() == 0)) {
+      return false;
+    }
     for (Type optionalType : optionalTypes) {
-      if (symbol.getSimpleName().toString().equals("isPresent")
-          && symbol.getParameters().length() == 0
-          && types.isSubtype(symbol.owner.type, optionalType)) return true;
+      if (types.isSubtype(symbol.owner.type, optionalType)) {
+        return true;
+      }
     }
     return false;
   }
 
   private boolean optionalIsGetCall(Symbol.MethodSymbol symbol, Types types) {
-    for (Type optionalType : optionalTypes) {
-      if (symbol.getSimpleName().toString().equals("get")
-          && symbol.getParameters().length() == 0
-          && types.isSubtype(symbol.owner.type, optionalType)) return true;
-    }
-    return false;
+    return isZeroArgOptionalMethod("get", symbol, types);
   }
 
-  private static VariableElement getOptionalContentElement() {
-    return new VariableElement() {
-      @Override
-      public Object getConstantValue() {
-        return null;
-      }
+  /**
+   * A {@link VariableElement} for a dummy "field" holding the contents of an Optional object, used
+   * in dataflow analysis to track whether the Optional content is present.
+   *
+   * <p>Instances of this type should be accessed using {@link #instance(Context)}, not instantiated
+   * directly.
+   */
+  private record OptionalContentVariableElement(Name name, TypeMirror asType)
+      implements VariableElement {
+    static final Context.Key<OptionalContentVariableElement> contextKey = new Context.Key<>();
 
-      @Override
-      public Name getSimpleName() {
-        return null;
-      }
+    private static final ImmutableSet<Modifier> MODIFIERS =
+        ImmutableSet.of(Modifier.PUBLIC, Modifier.FINAL);
 
-      @Override
-      public Element getEnclosingElement() {
-        return null;
+    static synchronized VariableElement instance(Context context) {
+      OptionalContentVariableElement instance = context.get(contextKey);
+      if (instance == null) {
+        instance =
+            new OptionalContentVariableElement(
+                Names.instance(context).fromString("value"), Symtab.instance(context).objectType);
+        context.put(contextKey, instance);
       }
+      return instance;
+    }
 
-      @Override
-      public List<? extends Element> getEnclosedElements() {
-        return null;
-      }
+    @Override
+    public @Nullable Object getConstantValue() {
+      return null;
+    }
 
-      @Override
-      public List<? extends AnnotationMirror> getAnnotationMirrors() {
-        return null;
-      }
+    @Override
+    public Name getSimpleName() {
+      return name;
+    }
 
-      @Override
-      public <A extends Annotation> A getAnnotation(Class<A> aClass) {
-        return null;
-      }
+    @Override
+    public @Nullable Element getEnclosingElement() {
+      // A field would have an enclosing element, however this method isn't guaranteed to
+      // return non-null in all cases. It may be beneficial to implement this in a future
+      // improvement, but that will require tracking an instance per supported optional
+      // type (e.g. java.util.Optional and guava Optional).
+      return null;
+    }
 
-      @Override
-      public <A extends Annotation> A[] getAnnotationsByType(Class<A> aClass) {
-        return null;
-      }
+    @Override
+    public List<? extends Element> getEnclosedElements() {
+      return Collections.emptyList();
+    }
 
-      @Override
-      public <R, P> R accept(ElementVisitor<R, P> elementVisitor, P p) {
-        return null;
-      }
+    @Override
+    public List<? extends AnnotationMirror> getAnnotationMirrors() {
+      return Collections.emptyList();
+    }
 
-      @Override
-      public TypeMirror asType() {
-        return null;
-      }
+    @Override
+    public <A extends Annotation> @Nullable A getAnnotation(Class<A> aClass) {
+      return null;
+    }
 
-      @Override
-      public ElementKind getKind() {
-        return null;
-      }
+    @Override
+    @SuppressWarnings("unchecked")
+    public <A extends Annotation> A[] getAnnotationsByType(Class<A> aClass) {
+      return (A[]) Array.newInstance(aClass, 0);
+    }
 
-      @Override
-      public Set<Modifier> getModifiers() {
-        return null;
-      }
+    @Override
+    public <R, P> R accept(ElementVisitor<R, P> elementVisitor, P p) {
+      return elementVisitor.visitVariable(this, p);
+    }
 
-      @Override
-      public String toString() {
-        return "OPTIONAL_CONTENT";
-      }
-    };
+    @Override
+    public ElementKind getKind() {
+      return ElementKind.FIELD;
+    }
+
+    @Override
+    public ImmutableSet<Modifier> getModifiers() {
+      return MODIFIERS;
+    }
+
+    @Override
+    public String toString() {
+      return "OPTIONAL_CONTENT";
+    }
   }
 }

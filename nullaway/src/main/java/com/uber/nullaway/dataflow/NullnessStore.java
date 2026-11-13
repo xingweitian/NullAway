@@ -16,38 +16,44 @@
 
 package com.uber.nullaway.dataflow;
 
-import static com.google.common.base.Preconditions.checkNotNull;
-import static com.google.common.collect.Sets.intersection;
-
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.sun.tools.javac.code.Types;
+import com.google.errorprone.VisitorState;
+import com.google.errorprone.util.ASTHelpers;
 import com.uber.nullaway.Nullness;
-import java.util.HashMap;
+import com.uber.nullaway.dataflow.AccessPath.IteratorContentsKey;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import javax.lang.model.element.Element;
+import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.Modifier;
 import org.checkerframework.nullaway.dataflow.analysis.Store;
 import org.checkerframework.nullaway.dataflow.cfg.node.FieldAccessNode;
 import org.checkerframework.nullaway.dataflow.cfg.node.LocalVariableNode;
 import org.checkerframework.nullaway.dataflow.cfg.node.MethodInvocationNode;
 import org.checkerframework.nullaway.dataflow.cfg.visualize.CFGVisualizer;
 import org.checkerframework.nullaway.dataflow.expression.JavaExpression;
+import org.jspecify.annotations.Nullable;
 
 /**
- * Highly based on {@link com.google.errorprone.dataflow.LocalStore}, but for {@link AccessPath}s.
+ * Highly based on {@code com.google.errorprone.dataflow.LocalStore}, but for {@link AccessPath}s.
  */
 public class NullnessStore implements Store<NullnessStore> {
 
   private static final NullnessStore EMPTY = new NullnessStore(ImmutableMap.of());
+
+  /** Canonical representation of a store for an unreachable control-flow path. */
+  private static final NullnessStore UNREACHABLE = new NullnessStore(ImmutableMap.of());
 
   private final ImmutableMap<AccessPath, Nullness> contents;
 
   private NullnessStore(Map<AccessPath, Nullness> contents) {
     this.contents = ImmutableMap.copyOf(contents);
   }
+
   /**
    * Produce an empty store.
    *
@@ -58,6 +64,25 @@ public class NullnessStore implements Store<NullnessStore> {
   }
 
   /**
+   * Produce the canonical store for an unreachable control-flow path.
+   *
+   * @return the unreachable store
+   */
+  static NullnessStore unreachable() {
+    return UNREACHABLE;
+  }
+
+  /**
+   * Check whether this store represents an unreachable control-flow path.
+   *
+   * @return {@code true} if this is the canonical unreachable store
+   */
+  @SuppressWarnings("ReferenceEquality")
+  boolean isUnreachable() {
+    return this == UNREACHABLE;
+  }
+
+  /**
    * Get the nullness for a local variable.
    *
    * @param node node representing local variable
@@ -65,8 +90,7 @@ public class NullnessStore implements Store<NullnessStore> {
    * @return fact associated with local
    */
   public Nullness valueOfLocalVariable(LocalVariableNode node, Nullness defaultValue) {
-    Nullness result = contents.get(AccessPath.fromLocal(node));
-    return result != null ? result : defaultValue;
+    return contents.getOrDefault(AccessPath.fromLocal(node), defaultValue);
   }
 
   /**
@@ -82,8 +106,7 @@ public class NullnessStore implements Store<NullnessStore> {
     if (path == null) {
       return defaultValue;
     }
-    Nullness result = contents.get(path);
-    return result != null ? result : defaultValue;
+    return contents.getOrDefault(path, defaultValue);
   }
 
   /**
@@ -95,15 +118,21 @@ public class NullnessStore implements Store<NullnessStore> {
    */
   public Nullness valueOfMethodCall(
       MethodInvocationNode node,
-      Types types,
+      VisitorState state,
       Nullness defaultValue,
       AccessPath.AccessPathContext apContext) {
-    AccessPath accessPath = AccessPath.fromMethodCall(node, types, apContext);
+    AccessPath accessPath;
+    if (AccessPath.isMapRemove(ASTHelpers.getSymbol(node.getTree()), state)) {
+      // Map.remove(key) returns the value associated with key before removing the entry, so use the
+      // pre-invocation fact for the corresponding Map.get(key) access path.
+      accessPath = AccessPath.getForMapInvocation(node, state, apContext);
+    } else {
+      accessPath = AccessPath.fromMethodCall(node, state, apContext);
+    }
     if (accessPath == null) {
       return defaultValue;
     }
-    Nullness result = contents.get(accessPath);
-    return result != null ? result : defaultValue;
+    return contents.getOrDefault(accessPath, defaultValue);
   }
 
   /**
@@ -123,18 +152,39 @@ public class NullnessStore implements Store<NullnessStore> {
   }
 
   /**
+   * If this store maps an access path {@code p} whose map-get argument is an {@link
+   * IteratorContentsKey} whose variable is {@code iteratorVar}, returns {@code p}. Otherwise,
+   * returns {@code null}.
+   */
+  public @Nullable AccessPath getMapGetIteratorContentsAccessPath(LocalVariableNode iteratorVar) {
+    for (AccessPath accessPath : contents.keySet()) {
+      MapKey mapGetArg = accessPath.getMapGetArg();
+      if (mapGetArg instanceof IteratorContentsKey iteratorContentsKey) {
+        if (iteratorContentsKey.getIteratorVarElement().equals(iteratorVar.getElement())) {
+          return accessPath;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
    * Gets the {@link Nullness} value of an access path.
    *
    * @param accessPath The access path.
    * @return The {@link Nullness} value of the access path.
    */
   public Nullness getNullnessOfAccessPath(AccessPath accessPath) {
-    if (contents == null) return Nullness.NULLABLE;
-    Nullness nullness = contents.get(accessPath);
-    return (nullness == null) ? Nullness.NULLABLE : nullness;
+    if (contents == null) {
+      return Nullness.NULLABLE;
+    }
+    return contents.getOrDefault(accessPath, Nullness.NULLABLE);
   }
 
   public Builder toBuilder() {
+    if (isUnreachable()) {
+      throw new IllegalStateException("cannot create a builder from the unreachable store");
+    }
     return new Builder(this);
   }
 
@@ -144,20 +194,45 @@ public class NullnessStore implements Store<NullnessStore> {
   }
 
   @Override
+  @SuppressWarnings("ReferenceEquality")
   public NullnessStore leastUpperBound(NullnessStore other) {
-    NullnessStore.Builder result = NullnessStore.empty().toBuilder();
-    for (AccessPath ap : intersection(contents.keySet(), other.contents.keySet())) {
-      Nullness apContents = contents.get(ap);
-      if (apContents == null) {
-        throw new RuntimeException("null contents for " + ap);
-      }
-      Nullness otherAPContents = other.contents.get(ap);
-      if (otherAPContents == null) {
-        throw new RuntimeException("null other contents for " + ap);
-      }
-      result.contents.put(ap, apContents.leastUpperBound(otherAPContents));
+    if (this == other) {
+      return this;
     }
-    return result.build();
+    if (this == UNREACHABLE) {
+      return other;
+    }
+    ImmutableMap<AccessPath, Nullness> thisContents = this.contents;
+    int thisContentsSize = thisContents.size();
+    if (thisContentsSize == 0) {
+      return this;
+    }
+    if (other == UNREACHABLE) {
+      return this;
+    }
+    ImmutableMap<AccessPath, Nullness> otherContents = other.contents;
+    int otherContentsSize = otherContents.size();
+    if (otherContentsSize == 0) {
+      return other;
+    }
+    ImmutableMap<AccessPath, Nullness> smallContents, largeContents;
+    if (thisContentsSize < otherContentsSize) {
+      smallContents = thisContents;
+      largeContents = otherContents;
+    } else {
+      smallContents = otherContents;
+      largeContents = thisContents;
+    }
+    ImmutableMap.Builder<AccessPath, Nullness> upperBoundContentsBuilder = ImmutableMap.builder();
+    for (Map.Entry<AccessPath, Nullness> entry : smallContents.entrySet()) {
+      AccessPath ap = entry.getKey();
+      Nullness largeValue = largeContents.get(ap);
+      if (largeValue != null) {
+        Nullness smallValue = entry.getValue();
+        upperBoundContentsBuilder.put(ap, smallValue.leastUpperBound(largeValue));
+      }
+    }
+    return new NullnessStore(upperBoundContentsBuilder.build());
   }
 
   @Override
@@ -166,22 +241,28 @@ public class NullnessStore implements Store<NullnessStore> {
   }
 
   @Override
-  public boolean equals(Object o) {
-    if (!(o instanceof NullnessStore)) {
+  @SuppressWarnings("ReferenceEquality")
+  public boolean equals(@Nullable Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (!(o instanceof NullnessStore other)) {
       return false;
     }
-    NullnessStore other = (NullnessStore) o;
+    if (this == UNREACHABLE || other == UNREACHABLE) {
+      return false;
+    }
     return contents.equals(other.contents);
   }
 
   @Override
   public int hashCode() {
-    return contents.hashCode();
+    return isUnreachable() ? 31 : contents.hashCode();
   }
 
   @Override
   public String toString() {
-    return contents.toString();
+    return isUnreachable() ? "UNREACHABLE" : contents.toString();
   }
 
   @Override
@@ -211,17 +292,20 @@ public class NullnessStore implements Store<NullnessStore> {
    */
   public NullnessStore uprootAccessPaths(
       Map<LocalVariableNode, LocalVariableNode> localVarTranslations) {
+    if (isUnreachable()) {
+      return this;
+    }
     NullnessStore.Builder nullnessBuilder = NullnessStore.empty().toBuilder();
     for (AccessPath ap : contents.keySet()) {
-      if (ap.getRoot().isReceiver()) {
+      Element element = ap.getRoot();
+      if (element == null) {
+        // Access path is rooted at the receiver, so we don't need to uproot it
         continue;
       }
-      Element varElement = ap.getRoot().getVarElement();
       for (LocalVariableNode fromVar : localVarTranslations.keySet()) {
-        if (varElement.equals(fromVar.getElement())) {
+        if (element.equals(fromVar.getElement())) {
           LocalVariableNode toVar = localVarTranslations.get(fromVar);
-          AccessPath newAP =
-              new AccessPath(new AccessPath.Root(toVar.getElement()), ap.getElements());
+          AccessPath newAP = AccessPath.switchRoot(ap, toVar.getElement());
           nullnessBuilder.setInformation(newAP, contents.get(ap));
         }
       }
@@ -236,21 +320,95 @@ public class NullnessStore implements Store<NullnessStore> {
    * @return NullnessStore containing only AccessPaths that pass the predicate
    */
   public NullnessStore filterAccessPaths(Predicate<AccessPath> pred) {
+    if (isUnreachable()) {
+      return this;
+    }
     return new NullnessStore(
-        contents
-            .entrySet()
-            .stream()
+        contents.entrySet().stream()
             .filter(e -> pred.test(e.getKey()))
             .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue)));
   }
 
+  /**
+   * Return all the fields in the store that are Non-Null.
+   *
+   * @return Set of fields (represented as {@code Element}s) that are non-null
+   */
+  public Set<Element> getNonNullReceiverFields() {
+    return getReceiverFields(Nullness.NONNULL);
+  }
+
+  /**
+   * Returns the fields of the receiver that hold a non-null value, or a value for which {@link
+   * Nullness#isNoChange()} holds.
+   *
+   * @return the initialized receiver fields
+   */
+  public Set<Element> getInitializedReceiverFields() {
+    return getReceiverFields(value -> value == Nullness.NONNULL || value.isNoChange());
+  }
+
+  /**
+   * Return all the static fields in the store that are Non-Null.
+   *
+   * @return Set of static fields (represented as {@code Element}s) that are non-null
+   */
+  public Set<Element> getNonNullStaticFields() {
+    Set<AccessPath> nonnullAccessPaths = this.getAccessPathsWithValue(Nullness.NONNULL);
+    Set<Element> result = new LinkedHashSet<>();
+    for (AccessPath ap : nonnullAccessPaths) {
+      if (ap.getRoot() != null) {
+        if (ap.getRoot().getModifiers().contains(Modifier.STATIC)) {
+          result.add(ap.getRoot());
+        }
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Return all the fields in the store that hold the {@code nullness} state.
+   *
+   * @param nullness The {@code Nullness} state
+   * @return Set of fields (represented as {@code Element}s) with the given {@code nullness}.
+   */
+  public Set<Element> getReceiverFields(Nullness nullness) {
+    return getReceiverFields(nullness::equals);
+  }
+
+  /**
+   * Returns the fields of the receiver whose nullness satisfies {@code predicate}.
+   *
+   * @param predicate test on the nullness a field holds
+   * @return the matching receiver fields
+   */
+  private Set<Element> getReceiverFields(Predicate<Nullness> predicate) {
+    Set<Element> result = new LinkedHashSet<>();
+    for (Map.Entry<AccessPath, Nullness> entry : contents.entrySet()) {
+      AccessPath ap = entry.getKey();
+      // A null root represents the receiver
+      if (predicate.test(entry.getValue()) && ap.getRoot() == null) {
+        ImmutableList<AccessPathElement> elements = ap.getElements();
+        if (elements.size() == 1) {
+          Element elem = elements.get(0).getJavaElement();
+          if (elem.getKind().equals(ElementKind.FIELD)) {
+            result.add(elem);
+          }
+        }
+      }
+    }
+    return result;
+  }
+
   /** class for building up instances of the store. */
   public static final class Builder {
-    private final Map<AccessPath, Nullness> contents;
+    private final ImmutableMap.Builder<AccessPath, Nullness> contents;
 
     Builder(NullnessStore prototype) {
-
-      contents = new HashMap<>(prototype.contents);
+      contents = ImmutableMap.builder();
+      if (!prototype.contents.isEmpty()) {
+        contents.putAll(prototype.contents);
+      }
     }
 
     /**
@@ -264,7 +422,7 @@ public class NullnessStore implements Store<NullnessStore> {
      * @return the new builder
      */
     public NullnessStore.Builder setInformation(AccessPath ap, Nullness value) {
-      contents.put(checkNotNull(ap), checkNotNull(value));
+      contents.put(ap, value);
       return this;
     }
 
@@ -274,7 +432,7 @@ public class NullnessStore implements Store<NullnessStore> {
      * @return a store constructed from everything added to the builder
      */
     public NullnessStore build() {
-      return new NullnessStore(contents);
+      return new NullnessStore(contents.buildKeepingLast());
     }
   }
 }

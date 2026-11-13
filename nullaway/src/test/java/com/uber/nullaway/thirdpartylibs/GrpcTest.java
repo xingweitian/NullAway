@@ -1,0 +1,222 @@
+/*
+ * Copyright (c) 2017 Uber Technologies, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+package com.uber.nullaway.thirdpartylibs;
+
+import com.google.errorprone.CompilationTestHelper;
+import com.uber.nullaway.NullAwayTestsBase;
+import java.util.Arrays;
+import org.junit.Before;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
+import org.junit.runner.RunWith;
+import org.junit.runners.JUnit4;
+
+/** Unit tests for {@link com.uber.nullaway.NullAway}. */
+@RunWith(JUnit4.class)
+@SuppressWarnings("CheckTestExtendsBaseClass")
+public class GrpcTest {
+
+  @Rule public final TemporaryFolder temporaryFolder = new TemporaryFolder();
+
+  private CompilationTestHelper ioGrpcCompilationTestHelper;
+
+  @SuppressWarnings("CheckReturnValue")
+  @Before
+  public void setup() {
+    ioGrpcCompilationTestHelper =
+        NullAwayTestsBase.makeTestHelperWithArgs(
+            getClass(),
+            Arrays.asList(
+                "-d",
+                temporaryFolder.getRoot().getAbsolutePath(),
+                "-XepOpt:NullAway:AnnotatedPackages=com.uber",
+                // The errors these tests expect depend on the @Nullable that
+                // io.grpc.Metadata.get(...) declares, and NullAway acknowledges an annotation
+                // in unannotated code only under AcknowledgeRestrictiveAnnotations. Without it,
+                // NullAway optimistically reads every Metadata.get(...) call as non-null.
+                "-XepOpt:NullAway:AcknowledgeRestrictiveAnnotations=true"));
+  }
+
+  @Test
+  public void ioGrpcMetadataAsMapTest() {
+    ioGrpcCompilationTestHelper
+        .addSourceLines(
+            "Keys.java",
+            """
+            package com.uber;
+            import io.grpc.Metadata;
+            public final class Keys {
+              static final Metadata.Key<String> KEY_1 = Metadata.Key.of("KEY1", Metadata.ASCII_STRING_MARSHALLER);
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import io.grpc.Metadata;
+            public class Test {
+              public void takeNonNullString(String s) { }
+              public void safeDeref(Metadata headers) {
+               if (headers.containsKey(Keys.KEY_1)) {
+                 takeNonNullString(headers.get(Keys.KEY_1));
+               }
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void ioGrpcMetadataAsMapPositiveTest() {
+    ioGrpcCompilationTestHelper
+        .addSourceLines(
+            "Keys.java",
+            """
+            package com.uber;
+            import io.grpc.Metadata;
+            public final class Keys {
+              static final Metadata.Key<String> KEY_1 = Metadata.Key.of("KEY1", Metadata.ASCII_STRING_MARSHALLER);
+              static final Metadata.Key<String> KEY_2 = Metadata.Key.of("KEY2", Metadata.ASCII_STRING_MARSHALLER);
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import io.grpc.Metadata;
+            public class Test {
+              public void takeNonNullString(String s) { }
+              public void safeDeref(Metadata headers) {
+               if (headers.containsKey(Keys.KEY_1)) {
+                 // BUG: Diagnostic contains: passing @Nullable parameter 'headers.get(Keys.KEY_2)'
+                 takeNonNullString(headers.get(Keys.KEY_2)); // Expect error: KEY_2 != KEY_1
+               }
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  /**
+   * A parenthesized {@code containsKey} key makes {@code get} of the same key non-null, as an
+   * unparenthesized one does, and leaves {@code get} of another key nullable. Before the fix,
+   * {@code GrpcHandler} found no field symbol behind the parentheses and left {@code get} of the
+   * same key nullable.
+   */
+  @Test
+  public void ioGrpcMetadataAsMapParenthesizedKeyTest() {
+    ioGrpcCompilationTestHelper
+        .addSourceLines(
+            "Keys.java",
+            """
+            package com.uber;
+            import io.grpc.Metadata;
+            public final class Keys {
+              static final Metadata.Key<String> KEY_1 = Metadata.Key.of("KEY1", Metadata.ASCII_STRING_MARSHALLER);
+              static final Metadata.Key<String> KEY_2 = Metadata.Key.of("KEY2", Metadata.ASCII_STRING_MARSHALLER);
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import io.grpc.Metadata;
+            public class Test {
+              public void takeNonNullString(String s) { }
+              public void safeDeref(Metadata headers) {
+               if (headers.containsKey(((Keys.KEY_1)))) {
+                 takeNonNullString(headers.get(Keys.KEY_1));
+               }
+              }
+              public void unsafeDeref(Metadata headers) {
+               if (headers.containsKey((Keys.KEY_1))) {
+                 // BUG: Diagnostic contains: passing @Nullable parameter 'headers.get(Keys.KEY_2)'
+                 takeNonNullString(headers.get(Keys.KEY_2));
+               }
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void ioGrpcMetadataAsAccessPathTest() {
+    ioGrpcCompilationTestHelper
+        .addSourceLines(
+            "Keys.java",
+            """
+            package com.uber;
+            import io.grpc.Metadata;
+            public final class Keys {
+              static final Metadata.Key<String> KEY_1 = Metadata.Key.of("KEY1", Metadata.ASCII_STRING_MARSHALLER);
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import io.grpc.Metadata;
+            public class Test {
+              public void takeNonNullString(String s) { }
+              public void safeDeref(Metadata headers) {
+               if (headers.get(Keys.KEY_1) != null) {
+                 takeNonNullString(headers.get(Keys.KEY_1));
+               }
+              }
+            }
+            """)
+        .doTest();
+  }
+
+  @Test
+  public void ioGrpcMetadataAsAccessPathPositiveTest() {
+    ioGrpcCompilationTestHelper
+        .addSourceLines(
+            "Keys.java",
+            """
+            package com.uber;
+            import io.grpc.Metadata;
+            public final class Keys {
+              static final Metadata.Key<String> KEY_1 = Metadata.Key.of("KEY1", Metadata.ASCII_STRING_MARSHALLER);
+              static final Metadata.Key<String> KEY_2 = Metadata.Key.of("KEY2", Metadata.ASCII_STRING_MARSHALLER);
+            }
+            """)
+        .addSourceLines(
+            "Test.java",
+            """
+            package com.uber;
+            import io.grpc.Metadata;
+            public class Test {
+              public void takeNonNullString(String s) { }
+              public void safeDeref(Metadata headers) {
+               if (headers.get(Keys.KEY_1) != null) {
+                 // BUG: Diagnostic contains: passing @Nullable parameter 'headers.get(Keys.KEY_2)'
+                 takeNonNullString(headers.get(Keys.KEY_2)); // Expect error: KEY_2 != KEY_1
+               }
+              }
+            }
+            """)
+        .doTest();
+  }
+}

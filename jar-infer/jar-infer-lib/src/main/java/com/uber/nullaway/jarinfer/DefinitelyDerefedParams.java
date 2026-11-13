@@ -52,7 +52,9 @@ public class DefinitelyDerefedParams {
   private boolean USE_EXTENDED_APPROACH = true;
 
   private static void LOG(boolean cond, String tag, String msg) {
-    if (cond) System.out.println("[JI " + tag + "] " + msg);
+    if (cond) {
+      System.out.println("[JI " + tag + "] " + msg);
+    }
   }
 
   private final IMethod method;
@@ -142,7 +144,7 @@ public class DefinitelyDerefedParams {
     // only basic blocks which do not require p being non-null (e.g. by dereferencing it), then
     // mark p as @NonNull
     for (int i = firstParamIndex; i <= numParam; i++) {
-      final Integer param = i - 1;
+      Integer param = i - 1;
       if (!DFS.getReachableNodes(
               prunedCFG,
               ImmutableList.of(prunedCFG.entry()),
@@ -190,17 +192,19 @@ public class DefinitelyDerefedParams {
       // Iterate over all instructions in BB
       for (int i = node.getFirstInstructionIndex(); i <= node.getLastInstructionIndex(); i++) {
         SSAInstruction instr = ir.getInstructions()[i];
-        if (instr == null) continue; // Some instructions are null (padding NoOps)
+        if (instr == null) { // Some instructions are null (padding NoOps)
+          continue;
+        }
         LOG(DEBUG, "DEBUG", "\tinst: " + instr.toString());
         int derefValueNumber = -1;
-        if (instr instanceof SSAGetInstruction && !((SSAGetInstruction) instr).isStatic()) {
-          derefValueNumber = ((SSAGetInstruction) instr).getRef();
-        } else if (instr instanceof SSAPutInstruction && !((SSAPutInstruction) instr).isStatic()) {
-          derefValueNumber = ((SSAPutInstruction) instr).getRef();
-        } else if (instr instanceof SSAAbstractInvokeInstruction) {
-          SSAAbstractInvokeInstruction callInst = (SSAAbstractInvokeInstruction) instr;
+        if (instr instanceof SSAGetInstruction ssaGetInstruction && !ssaGetInstruction.isStatic()) {
+          derefValueNumber = ssaGetInstruction.getRef();
+        } else if (instr instanceof SSAPutInstruction ssaPutInstruction
+            && !ssaPutInstruction.isStatic()) {
+          derefValueNumber = ssaPutInstruction.getRef();
+        } else if (instr instanceof SSAAbstractInvokeInstruction callInst) {
           String sign = callInst.getDeclaredTarget().getSignature();
-          if (((SSAAbstractInvokeInstruction) instr).isStatic()) {
+          if (callInst.isStatic()) {
             // All supported Null testing APIs are static methods
             if (NULL_TEST_APIS.containsKey(sign)) {
               derefValueNumber = callInst.getUse(NULL_TEST_APIS.get(sign));
@@ -208,8 +212,9 @@ public class DefinitelyDerefedParams {
           } else {
             Preconditions.checkArgument(
                 !NULL_TEST_APIS.containsKey(sign),
-                "Add support for non-static NULL_TEST_APIS : " + sign);
-            derefValueNumber = ((SSAAbstractInvokeInstruction) instr).getReceiver();
+                "Add support for non-static NULL_TEST_APIS : %s",
+                sign);
+            derefValueNumber = callInst.getReceiver();
           }
         }
         if (derefValueNumber >= firstParamIndex && derefValueNumber <= numParam) {
@@ -252,8 +257,7 @@ public class DefinitelyDerefedParams {
     for (ISSABasicBlock bb : prunedCFG.getNormalPredecessors(prunedCFG.exit())) {
       for (int i = bb.getFirstInstructionIndex(); i <= bb.getLastInstructionIndex(); i++) {
         SSAInstruction instr = ir.getInstructions()[i];
-        if (instr instanceof SSAReturnInstruction) {
-          SSAReturnInstruction retInstr = (SSAReturnInstruction) instr;
+        if (instr instanceof SSAReturnInstruction retInstr) {
           if (ir.getSymbolTable().isNullConstant(retInstr.getResult())) {
             LOG(DEBUG, "DEBUG", "Nullable return in method: " + method.getSignature());
             return NullnessHint.NULLABLE;

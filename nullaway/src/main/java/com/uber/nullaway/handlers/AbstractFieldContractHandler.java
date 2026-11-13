@@ -22,6 +22,9 @@
 
 package com.uber.nullaway.handlers;
 
+import static com.google.errorprone.util.ASTHelpers.getEnclosedElements;
+import static com.uber.nullaway.NullabilityUtil.castToNonNull;
+
 import com.google.common.base.Preconditions;
 import com.google.errorprone.VisitorState;
 import com.google.errorprone.util.ASTHelpers;
@@ -33,19 +36,20 @@ import com.uber.nullaway.NullabilityUtil;
 import com.uber.nullaway.handlers.contract.ContractUtils;
 import java.util.Collections;
 import java.util.Set;
-import javax.annotation.Nullable;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.VariableElement;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Abstract base class for handlers that process pre- and post-condition annotations for fields.
  * Note: all fields that are going to be processed must be the fields of the receiver. (e.g. field
  * or this.field)
  */
-public abstract class AbstractFieldContractHandler extends BaseNoOpHandler {
+public abstract class AbstractFieldContractHandler implements Handler {
 
   protected static final String THIS_NOTATION = "this.";
+
   /** Simple name of the annotation in {@code String} */
   protected final String annotName;
 
@@ -56,21 +60,22 @@ public abstract class AbstractFieldContractHandler extends BaseNoOpHandler {
   /**
    * Verifies that the method being processed adheres to the annotation specifications.
    *
-   * @param analysis NullAway instance.
    * @param tree Method tree under processing.
-   * @param state Error Prone {@link VisitorState}.
-   * @param methodSymbol Processing method symbol.
+   * @param methodAnalysisContext The MethodAnalysisContext object
    */
   @Override
-  public void onMatchMethod(
-      NullAway analysis, MethodTree tree, VisitorState state, Symbol.MethodSymbol methodSymbol) {
+  public void onMatchMethod(MethodTree tree, MethodAnalysisContext methodAnalysisContext) {
+
+    Symbol.MethodSymbol methodSymbol = methodAnalysisContext.methodSymbol();
+    VisitorState state = methodAnalysisContext.state();
     Set<String> annotationContent =
         NullabilityUtil.getAnnotationValueArray(methodSymbol, annotName, false);
     boolean isAnnotated = annotationContent != null;
     boolean isValid =
         isAnnotated
-            && validateAnnotationSyntax(annotationContent, analysis, tree, state, methodSymbol)
-            && validateAnnotationSemantics(analysis, state, tree, methodSymbol);
+            && validateAnnotationSyntax(
+                castToNonNull(annotationContent), tree, methodAnalysisContext)
+            && validateAnnotationSemantics(tree, methodAnalysisContext);
     if (isAnnotated && !isValid) {
       return;
     }
@@ -81,12 +86,13 @@ public abstract class AbstractFieldContractHandler extends BaseNoOpHandler {
     }
     Set<String> fieldNames;
     if (isAnnotated) {
-      fieldNames = ContractUtils.trimReceivers(annotationContent);
+      fieldNames = ContractUtils.trimReceivers(castToNonNull(annotationContent));
     } else {
       fieldNames = Collections.emptySet();
     }
-    validateOverridingRules(fieldNames, analysis, state, tree, closestOverriddenMethod);
-    super.onMatchMethod(analysis, tree, state, methodSymbol);
+    validateOverridingRules(
+        fieldNames, methodAnalysisContext.analysis(), state, tree, closestOverriddenMethod);
+    Handler.super.onMatchMethod(tree, methodAnalysisContext);
   }
 
   /**
@@ -112,15 +118,14 @@ public abstract class AbstractFieldContractHandler extends BaseNoOpHandler {
    * Validates that a method implementation matches the semantics of the annotation.
    *
    * @return Returns true, if the annotation conforms to the semantic rules.
+   * @param methodAnalysisContext The MethodAnalysisContext object
    */
   protected abstract boolean validateAnnotationSemantics(
-      NullAway analysis, VisitorState state, MethodTree tree, Symbol.MethodSymbol methodSymbol);
+      MethodTree tree, MethodAnalysisContext methodAnalysisContext);
 
   /**
    * Validates whether the parameter inside annotation conforms to the syntax rules. Parameters must
    * conform to the following rules:
-   *
-   * <p>
    *
    * <ul>
    *   <li>Cannot annotate a method with empty param set.
@@ -129,17 +134,14 @@ public abstract class AbstractFieldContractHandler extends BaseNoOpHandler {
    *       super classes.
    * </ul>
    *
-   * <p>
-   *
    * @return Returns true, if the annotation conforms to the syntax rules.
+   * @param methodAnalysisContext The MethodAnalysisContext object
    */
   protected boolean validateAnnotationSyntax(
-      Set<String> content,
-      NullAway analysis,
-      MethodTree tree,
-      VisitorState state,
-      Symbol.MethodSymbol methodSymbol) {
+      Set<String> content, MethodTree tree, MethodAnalysisContext methodAnalysisContext) {
     String message;
+    VisitorState state = methodAnalysisContext.state();
+    NullAway analysis = methodAnalysisContext.analysis();
     if (content.isEmpty()) {
       // we should not allow useless annotations.
       message =
@@ -153,10 +155,35 @@ public abstract class AbstractFieldContractHandler extends BaseNoOpHandler {
                   new ErrorMessage(ErrorMessage.MessageTypes.ANNOTATION_VALUE_INVALID, message),
                   tree,
                   analysis.buildDescription(tree),
-                  state));
+                  state,
+                  null));
       return false;
     } else {
+      Symbol.ClassSymbol classSymbol =
+          castToNonNull(ASTHelpers.enclosingClass(methodAnalysisContext.methodSymbol()));
       for (String fieldName : content) {
+        if (isThisDotStaticField(classSymbol, fieldName)) {
+
+          message =
+              "Cannot refer to static field "
+                  + fieldName.substring(THIS_NOTATION.length())
+                  + " using this.";
+          state.reportMatch(
+              analysis
+                  .getErrorBuilder()
+                  .createErrorDescription(
+                      new ErrorMessage(ErrorMessage.MessageTypes.ANNOTATION_VALUE_INVALID, message),
+                      tree,
+                      analysis.buildDescription(tree),
+                      state,
+                      null));
+          return false;
+        }
+        VariableElement field = getFieldOfClass(classSymbol, fieldName);
+        if (field != null && field.getModifiers().contains(Modifier.STATIC)) {
+          continue;
+        }
+
         if (fieldName.contains(".")) {
           if (!fieldName.startsWith(THIS_NOTATION)) {
             message =
@@ -174,14 +201,14 @@ public abstract class AbstractFieldContractHandler extends BaseNoOpHandler {
                             ErrorMessage.MessageTypes.ANNOTATION_VALUE_INVALID, message),
                         tree,
                         analysis.buildDescription(tree),
-                        state));
+                        state,
+                        null));
             return false;
           } else {
             fieldName = fieldName.substring(fieldName.lastIndexOf(".") + 1);
           }
         }
-        Symbol.ClassSymbol classSymbol = ASTHelpers.enclosingClass(methodSymbol);
-        VariableElement field = getInstanceFieldOfClass(classSymbol, fieldName);
+        field = getFieldOfClass(classSymbol, fieldName);
         if (field == null) {
           message =
               "For @"
@@ -190,6 +217,7 @@ public abstract class AbstractFieldContractHandler extends BaseNoOpHandler {
                   + fieldName
                   + " in class "
                   + classSymbol.getSimpleName();
+
           state.reportMatch(
               analysis
                   .getErrorBuilder()
@@ -197,7 +225,8 @@ public abstract class AbstractFieldContractHandler extends BaseNoOpHandler {
                       new ErrorMessage(ErrorMessage.MessageTypes.ANNOTATION_VALUE_INVALID, message),
                       tree,
                       analysis.buildDescription(tree),
-                      state));
+                      state,
+                      null));
           return false;
         }
       }
@@ -212,11 +241,11 @@ public abstract class AbstractFieldContractHandler extends BaseNoOpHandler {
    * @param name Name of the field.
    * @return The field with the given name, or {@code null} if the field cannot be found
    */
-  public static @Nullable VariableElement getInstanceFieldOfClass(
+  public static @Nullable VariableElement getFieldOfClass(
       Symbol.ClassSymbol classSymbol, String name) {
     Preconditions.checkNotNull(classSymbol);
-    for (Element member : classSymbol.getEnclosedElements()) {
-      if (member.getKind().isField() && !member.getModifiers().contains(Modifier.STATIC)) {
+    for (Element member : getEnclosedElements(classSymbol)) {
+      if (member.getKind().isField()) {
         if (member.getSimpleName().toString().equals(name)) {
           return (VariableElement) member;
         }
@@ -224,8 +253,18 @@ public abstract class AbstractFieldContractHandler extends BaseNoOpHandler {
     }
     Symbol.ClassSymbol superClass = (Symbol.ClassSymbol) classSymbol.getSuperclass().tsym;
     if (superClass != null) {
-      return getInstanceFieldOfClass(superClass, name);
+      return getFieldOfClass(superClass, name);
     }
     return null;
+  }
+
+  protected boolean isThisDotStaticField(Symbol.ClassSymbol classSymbol, String expression) {
+    if (expression.contains(".") && expression.startsWith(THIS_NOTATION)) {
+      String fieldName = expression.substring(THIS_NOTATION.length());
+      VariableElement field = getFieldOfClass(classSymbol, fieldName);
+      return field != null && field.getModifiers().contains(Modifier.STATIC);
+    }
+
+    return false;
   }
 }

@@ -1,0 +1,123 @@
+package com.uber.nullaway.generics;
+
+import static java.util.stream.Collectors.joining;
+
+import com.google.errorprone.VisitorState;
+import com.google.errorprone.util.ASTHelpers;
+import com.sun.tools.javac.code.Attribute;
+import com.sun.tools.javac.code.BoundKind;
+import com.sun.tools.javac.code.Type;
+import com.sun.tools.javac.code.Types;
+import org.jspecify.annotations.Nullable;
+
+/**
+ * A visitor that pretty prints a generic type including its type-use nullability annotations, for
+ * use in error messages.
+ *
+ * <p>This code is a modified and extended version of code in {@link
+ * com.google.errorprone.util.Signatures}
+ */
+final class GenericTypePrettyPrintingVisitor
+    extends Types.DefaultTypeVisitor<String, @Nullable Void> {
+
+  private final VisitorState state;
+
+  GenericTypePrettyPrintingVisitor(VisitorState state) {
+    this.state = state;
+  }
+
+  @Override
+  public String visitWildcardType(Type.WildcardType t, @Nullable Void unused) {
+    // NOTE: we have not tested this code yet as we do not yet support wildcard types
+    StringBuilder sb = new StringBuilder();
+    sb.append(t.kind);
+    if (t.kind != BoundKind.UNBOUND) {
+      sb.append(t.type.accept(this, null));
+    }
+    return sb.toString();
+  }
+
+  @Override
+  public String visitClassType(Type.ClassType t, @Nullable Void s) {
+    if (t.isIntersection()) {
+      return prettyIntersectionType((Type.IntersectionClassType) t);
+    }
+    if (t.tsym.isAnonymous()) {
+      // eventually, we could probably do even better formatting here, but this provides all the
+      // needed information for now
+      return t.toString();
+    }
+    StringBuilder sb = new StringBuilder();
+    Type enclosingType = t.getEnclosingType();
+    if (!ASTHelpers.isSameType(enclosingType, Type.noType, state)) {
+      sb.append(enclosingType.accept(this, null)).append('.');
+    }
+    appendNullableAnnotationIfPresent(t, sb);
+    sb.append(t.tsym.getSimpleName());
+    if (t.getTypeArguments().nonEmpty()) {
+      sb.append('<');
+      sb.append(
+          t.getTypeArguments().stream().map(a -> a.accept(this, null)).collect(joining(", ")));
+      sb.append(">");
+    }
+    return sb.toString();
+  }
+
+  /**
+   * Appends {@code "@Nullable "} to {@code sb} if {@code t} has a type-use {@code @Nullable}
+   * annotation. We ignore all other type use annotations, including {@code @NonNull} as it is the
+   * default
+   */
+  private void appendNullableAnnotationIfPresent(Type t, StringBuilder sb) {
+    for (Attribute.TypeCompound compound : t.getAnnotationMirrors()) {
+      String annotName = compound.type.accept(this, null);
+      if ("Nullable".equals(annotName)) {
+        sb.append("@Nullable ");
+        break;
+      }
+    }
+  }
+
+  @Override
+  public String visitTypeVar(Type.TypeVar t, @Nullable Void unused) {
+    StringBuilder sb = new StringBuilder();
+    appendNullableAnnotationIfPresent(t, sb);
+    sb.append(t.tsym.getSimpleName());
+    return sb.toString();
+  }
+
+  private String prettyIntersectionType(Type.IntersectionClassType t) {
+    return t.getBounds().stream()
+        .map(type -> ((Type) type).accept(this, null))
+        .collect(joining(" & "));
+  }
+
+  @Override
+  public String visitCapturedType(Type.CapturedType t, @Nullable Void s) {
+    StringBuilder sb = new StringBuilder();
+    appendNullableAnnotationIfPresent(t, sb);
+    sb.append("capture of ");
+    sb.append(t.wildcard.accept(this, null));
+    return sb.toString();
+  }
+
+  @Override
+  public String visitArrayType(Type.ArrayType t, @Nullable Void unused) {
+    StringBuilder sb = new StringBuilder();
+    sb.append(t.elemtype.accept(this, null)).append(' ');
+    appendNullableAnnotationIfPresent(t, sb);
+    return sb.append("[]").toString();
+  }
+
+  @Override
+  public String visitErrorType(Type.ErrorType t, @Nullable Void unused) {
+    // this arises for our synthetic @Nullable and @NonNull annotations; we just return the simple
+    // name
+    return t.tsym.getSimpleName().toString();
+  }
+
+  @Override
+  public String visitType(Type t, @Nullable Void s) {
+    return t.toString();
+  }
+}

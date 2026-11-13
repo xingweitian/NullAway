@@ -8,8 +8,8 @@ import com.sun.source.tree.Tree;
 import com.sun.tools.javac.util.Context;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import javax.annotation.Nullable;
 import javax.lang.model.element.NestingKind;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Stores info on nullness of local variables in enclosing environments, used when performing
@@ -33,12 +33,11 @@ public class EnclosingEnvironmentNullness {
   }
 
   public void addEnvironmentMapping(Tree t, NullnessStore s) {
-    Preconditions.checkArgument(isValidTreeType(t), "cannot store environment for node " + t);
+    Preconditions.checkArgument(isValidTreeType(t), "cannot store environment for node %s", t);
     environmentNullness.put(t, s);
   }
 
-  @Nullable
-  public NullnessStore getEnvironmentMapping(Tree t) {
+  public @Nullable NullnessStore getEnvironmentMapping(Tree t) {
     Preconditions.checkArgument(isValidTreeType(t));
     return environmentNullness.get(t);
   }
@@ -52,8 +51,8 @@ public class EnclosingEnvironmentNullness {
     if (t instanceof LambdaExpressionTree) {
       return true;
     }
-    if (t instanceof ClassTree) {
-      NestingKind nestingKind = ASTHelpers.getSymbol((ClassTree) t).getNestingKind();
+    if (t instanceof ClassTree classTree) {
+      NestingKind nestingKind = ASTHelpers.getSymbol(classTree).getNestingKind();
       return nestingKind.equals(NestingKind.ANONYMOUS) || nestingKind.equals(NestingKind.LOCAL);
     }
     return false;

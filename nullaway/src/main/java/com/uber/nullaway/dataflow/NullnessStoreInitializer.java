@@ -1,5 +1,7 @@
 package com.uber.nullaway.dataflow;
 
+import static com.google.errorprone.util.ASTHelpers.enclosingClass;
+
 import com.google.errorprone.util.ASTHelpers;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.util.Trees;
@@ -11,10 +13,10 @@ import com.uber.nullaway.Config;
 import com.uber.nullaway.handlers.Handler;
 import java.util.List;
 import java.util.Objects;
-import javax.annotation.Nullable;
 import javax.lang.model.element.NestingKind;
 import org.checkerframework.nullaway.dataflow.cfg.UnderlyingAST;
 import org.checkerframework.nullaway.dataflow.cfg.node.LocalVariableNode;
+import org.jspecify.annotations.Nullable;
 
 /**
  * An abstract class that allows overriding initialization of nullness store in dataflow. Currently,
@@ -60,22 +62,21 @@ public abstract class NullnessStoreInitializer {
     return envStore;
   }
 
-  @Nullable
-  private static ClassTree findEnclosingLocalOrAnonymousClass(
+  private static @Nullable ClassTree findEnclosingLocalOrAnonymousClass(
       ClassTree classTree, Context context) {
     Symbol.ClassSymbol symbol = ASTHelpers.getSymbol(classTree);
     // we need this while loop since we can have a NestingKind.NESTED class (i.e., a nested
     // class declared at the top-level within its enclosing class) nested (possibly deeply)
     // within a NestingKind.ANONYMOUS or NestingKind.LOCAL class
-    while (symbol.getNestingKind().isNested()) {
+    while (symbol != null && symbol.getNestingKind().isNested()) {
       if (symbol.getNestingKind().equals(NestingKind.ANONYMOUS)
           || symbol.getNestingKind().equals(NestingKind.LOCAL)) {
         return Trees.instance(JavacProcessingEnvironment.instance(context)).getTree(symbol);
       } else {
         // symbol.owner is the enclosing element, which could be a class or a method.
-        // if it's a class, the enclClass() method will (surprisingly) return the class itself,
+        // if it's a class, the enclosingClass() method will (surprisingly) return the class itself,
         // so this works
-        symbol = symbol.owner.enclClass();
+        symbol = enclosingClass(symbol);
       }
     }
     return null;

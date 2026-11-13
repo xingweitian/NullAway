@@ -1,0 +1,289 @@
+package com.uber.nullaway.handlers;
+
+/*
+ * Copyright (c) 2024 Uber Technologies, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.SetMultimap;
+import com.uber.nullaway.jarinfer.JarInferStubxProvider;
+import com.uber.nullaway.libmodel.NestedAnnotationInfo;
+import com.uber.nullaway.libmodel.NestedAnnotationInfo.Annotation;
+import com.uber.nullaway.libmodel.NestedAnnotationInfo.TypePathEntry;
+import com.uber.nullaway.libmodel.NestedAnnotationInfo.TypePathEntry.Kind;
+import java.io.DataInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.Map;
+import java.util.ServiceLoader;
+import java.util.Set;
+
+/**
+ * A class responsible for caching annotation information extracted from stubx files.
+ *
+ * <p>This class provides mechanisms to cache annotations and retrieve them efficiently when needed.
+ * It uses a nested map structure to store annotations, which are indexed by class name, method
+ * signature, and argument index. It also stores a Map containing the indices for Nullable upper
+ * bounds for generic type parameters.
+ */
+public class StubxCacheUtil {
+
+  /**
+   * The file magic number for version 1 .astubx files. It should be the first four bytes of any
+   * compatible .astubx file.
+   */
+  private static final int VERSION_1_FILE_MAGIC_NUMBER = 481874642;
+
+  /**
+   * The file magic number for version 2 .astubx files. Version 2 adds a trailing section for
+   * nullable fields.
+   */
+  private static final int VERSION_2_FILE_MAGIC_NUMBER = 481874643;
+
+  private boolean DEBUG = false;
+  private String logCaller = "";
+
+  private void LOG(boolean cond, String tag, String msg) {
+    if (cond) {
+      System.out.println("[" + logCaller + " " + tag + "] " + msg);
+    }
+  }
+
+  private static final int RETURN = -1;
+
+  private final Map<String, Map<String, Map<Integer, Set<String>>>> argAnnotCache;
+
+  private final SetMultimap<String, Integer> upperBoundCache;
+
+  private final Set<String> nullMarkedClassesCache;
+
+  private final SetMultimap<String, Integer> methodTypeParamNullableUpperBoundCache;
+
+  private final Map<String, SetMultimap<Integer, NestedAnnotationInfo>> nestedAnnotationInfoCache;
+
+  /** Map from flat class name to the names of its nullable fields. */
+  private final SetMultimap<String, String> nullableFieldsCache;
+
+  /**
+   * Initializes a new {@code StubxCacheUtil} instance, optionally loading JarInfer stubx files
+   * discovered on the classpath.
+   *
+   * @param logCaller Identifier for logging purposes.
+   * @param loadJarInferModels whether to load stubx files provided by {@link JarInferStubxProvider}
+   *     implementations
+   */
+  StubxCacheUtil(String logCaller, boolean loadJarInferModels) {
+    argAnnotCache = new LinkedHashMap<>();
+    upperBoundCache = HashMultimap.create();
+    nullMarkedClassesCache = new HashSet<>();
+    methodTypeParamNullableUpperBoundCache = HashMultimap.create();
+    nestedAnnotationInfoCache = new HashMap<>();
+    nullableFieldsCache = HashMultimap.create();
+    this.logCaller = logCaller;
+    if (loadJarInferModels) {
+      loadStubxFiles();
+    }
+  }
+
+  public SetMultimap<String, Integer> getUpperBoundCache() {
+    return upperBoundCache;
+  }
+
+  public Set<String> getNullMarkedClassesCache() {
+    return nullMarkedClassesCache;
+  }
+
+  public SetMultimap<String, Integer> getMethodTypeParamNullableUpperBoundCache() {
+    return methodTypeParamNullableUpperBoundCache;
+  }
+
+  public Map<String, SetMultimap<Integer, NestedAnnotationInfo>> getNestedAnnotationInfoCache() {
+    return nestedAnnotationInfoCache;
+  }
+
+  public Map<String, Map<String, Map<Integer, Set<String>>>> getArgAnnotCache() {
+    return argAnnotCache;
+  }
+
+  public SetMultimap<String, String> getNullableFieldsCache() {
+    return nullableFieldsCache;
+  }
+
+  /**
+   * Loads all stubx files discovered in the classpath. Stubx files are discovered via
+   * implementations of {@link JarInferStubxProvider} loaded using a {@link ServiceLoader}
+   */
+  private void loadStubxFiles() {
+    Iterable<JarInferStubxProvider> astubxProviders =
+        ServiceLoader.load(JarInferStubxProvider.class, StubxCacheUtil.class.getClassLoader());
+    for (JarInferStubxProvider provider : astubxProviders) {
+      for (String astubxPath : provider.pathsToStubxFiles()) {
+        Class<? extends JarInferStubxProvider> providerClass = provider.getClass();
+        String stubxLocation = providerClass + ":" + astubxPath;
+        try (InputStream stubxInputStream =
+            LibraryModelsHandler.openResourceWithoutCaching(
+                providerClass.getResource(astubxPath))) {
+          if (stubxInputStream == null) {
+            throw new RuntimeException("could not get input stream for " + astubxPath);
+          }
+          parseStubStream(stubxInputStream, stubxLocation);
+          LOG(DEBUG, "DEBUG", "loaded stubx file " + stubxLocation);
+        } catch (IOException e) {
+          throw new RuntimeException("could not parse stubx file " + stubxLocation, e);
+        }
+      }
+    }
+  }
+
+  public void parseStubStream(InputStream stubxInputStream, String stubxLocation)
+      throws IOException {
+    String[] strings;
+    DataInputStream in = new DataInputStream(stubxInputStream);
+    // Read and check the magic version number
+    int magicNumber = in.readInt();
+    if (magicNumber != VERSION_1_FILE_MAGIC_NUMBER && magicNumber != VERSION_2_FILE_MAGIC_NUMBER) {
+      throw new Error("Invalid file version/magic number for stubx file!" + stubxLocation);
+    }
+    // Read the number of strings in the string dictionary
+    int numStrings = in.readInt();
+    // Populate the string dictionary {idx => value}, where idx is encoded by the string position
+    // inside this section.
+    strings = new String[numStrings];
+    for (int i = 0; i < numStrings; ++i) {
+      strings[i] = in.readUTF();
+    }
+    // Read the number of (package, annotation) entries
+    int numPackages = in.readInt();
+    // Read each (package, annotation) entry, where the int values point into the string
+    // dictionary loaded before.
+    for (int i = 0; i < numPackages; ++i) {
+      in.readInt(); // String packageName = strings[in.readInt()];
+      in.readInt(); // String annotation = strings[in.readInt()];
+    }
+    // Read the number of (type, annotation) entries
+    int numTypes = in.readInt();
+    // Read each (type, annotation) entry, where the int values point into the string
+    // dictionary loaded before.
+    for (int i = 0; i < numTypes; ++i) {
+      in.readInt(); // String typeName = strings[in.readInt()];
+      in.readInt(); // String annotation = strings[in.readInt()];
+    }
+    // Read the number of (method, annotation) entries
+    int numMethods = in.readInt();
+    // Read each (method, annotation) record
+    for (int i = 0; i < numMethods; ++i) {
+      String methodSig = strings[in.readInt()];
+      String annotation = strings[in.readInt()];
+      LOG(DEBUG, "DEBUG", "method: " + methodSig + ", return annotation: " + annotation);
+      cacheAnnotation(methodSig, RETURN, annotation);
+    }
+    // Read the number of (method, nullable type parameter index)
+    int numMethodTypeParams = in.readInt();
+    for (int i = 0; i < numMethodTypeParams; ++i) {
+      String methodSig = strings[in.readInt()];
+      int idx = in.readInt();
+      this.methodTypeParamNullableUpperBoundCache.put(methodSig, idx);
+    }
+    // Read the number of (method, argument, annotation) entries
+    int numArgumentRecords = in.readInt();
+    // Read each (method, argument, annotation) record
+    for (int i = 0; i < numArgumentRecords; ++i) {
+      String methodSig = strings[in.readInt()];
+      if (methodSig.lastIndexOf(':') == -1 || methodSig.split(":")[0].lastIndexOf('.') == -1) {
+        throw new Error(
+            "Invalid method signature " + methodSig + " in stubx file " + stubxLocation);
+      }
+      int argNum = in.readInt();
+      String annotation = strings[in.readInt()];
+      LOG(
+          DEBUG,
+          "DEBUG",
+          "method: " + methodSig + ", argNum: " + argNum + ", arg annotation: " + annotation);
+      cacheAnnotation(methodSig, argNum, annotation);
+    }
+    // nested annotation info in methods
+    int methodNestedAnnotSize = in.readInt();
+    for (int i = 0; i < methodNestedAnnotSize; i++) {
+      String methodSig = strings[in.readInt()];
+      int index = in.readInt(); // -1: return type, 0+: parameter index
+      String annotation = strings[in.readInt()];
+      int typePathLength = in.readInt();
+      ImmutableList.Builder<TypePathEntry> typePathEntryBuilder = new ImmutableList.Builder<>();
+      for (int j = 0; j < typePathLength; j++) {
+        String kind = strings[in.readInt()];
+        int typePathIndex = in.readInt();
+        typePathEntryBuilder.add(new TypePathEntry(Kind.valueOf(kind), typePathIndex));
+      }
+      NestedAnnotationInfo nestedAnnotationInfo =
+          new NestedAnnotationInfo(Annotation.valueOf(annotation), typePathEntryBuilder.build());
+      SetMultimap<Integer, NestedAnnotationInfo> targetMap =
+          this.nestedAnnotationInfoCache.computeIfAbsent(methodSig, k -> HashMultimap.create());
+      targetMap.put(index, nestedAnnotationInfo);
+    }
+    // reading the NullMarked classes
+    int numNullMarkedClasses = in.readInt();
+    for (int i = 0; i < numNullMarkedClasses; i++) {
+      this.nullMarkedClassesCache.add(strings[in.readInt()]);
+    }
+    // read the number of nullable upper bound entries
+    int numClassesWithNullableUpperBounds = in.readInt();
+    for (int i = 0; i < numClassesWithNullableUpperBounds; i++) {
+      int numParams = in.readInt();
+      for (int j = 0; j < numParams; j++) {
+        cacheUpperBounds(strings[in.readInt()], in.readInt());
+      }
+    }
+    if (magicNumber == VERSION_2_FILE_MAGIC_NUMBER) {
+      // read the nullable fields
+      int numClassesWithNullableFields = in.readInt();
+      for (int i = 0; i < numClassesWithNullableFields; i++) {
+        String className = strings[in.readInt()];
+        int numFields = in.readInt();
+        for (int j = 0; j < numFields; j++) {
+          String fieldName = strings[in.readInt()];
+          LOG(DEBUG, "DEBUG", "nullable field: " + className + "." + fieldName);
+          nullableFieldsCache.put(className, fieldName);
+        }
+      }
+    }
+  }
+
+  private void cacheAnnotation(String methodSig, Integer argNum, String annotation) {
+    // TODO: handle inner classes properly
+    String className = methodSig.split(":")[0].replace('$', '.');
+    Map<String, Map<Integer, Set<String>>> cacheForClass =
+        argAnnotCache.computeIfAbsent(className, s -> new LinkedHashMap<>());
+    Map<Integer, Set<String>> cacheForMethod =
+        cacheForClass.computeIfAbsent(methodSig, s -> new LinkedHashMap<>());
+    Set<String> cacheForArgument =
+        cacheForMethod.computeIfAbsent(argNum, s -> new LinkedHashSet<>());
+    cacheForArgument.add(annotation);
+  }
+
+  private void cacheUpperBounds(String className, Integer paramIndex) {
+    upperBoundCache.put(className, paramIndex);
+  }
+}

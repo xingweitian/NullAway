@@ -30,16 +30,15 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
-import javax.annotation.Nullable;
 import javax.tools.DiagnosticListener;
 import javax.tools.JavaCompiler;
 import javax.tools.JavaFileObject;
 import javax.tools.SimpleJavaFileObject;
 import javax.tools.StandardJavaFileManager;
 import javax.tools.ToolProvider;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Code to run Javac with NullAway enabled, designed to aid benchmarking. Construction of {@code
@@ -48,14 +47,12 @@ import javax.tools.ToolProvider;
  */
 public class NullawayJavac {
 
-  //////////////////////
   // state required to run javac via the standard APIs
-  //////////////////////
-  private List<JavaFileObject> compilationUnits;
-  private JavaCompiler compiler;
-  @Nullable private DiagnosticListener<JavaFileObject> diagnosticListener;
-  private StandardJavaFileManager fileManager;
-  private List<String> options;
+  private final List<JavaFileObject> compilationUnits;
+  private final JavaCompiler compiler;
+  private final @Nullable DiagnosticListener<JavaFileObject> diagnosticListener;
+  private final StandardJavaFileManager fileManager;
+  private final List<String> options;
 
   /**
    * Sets up compilation for a simple single source file, for testing / sanity checking purposes.
@@ -79,7 +76,11 @@ public class NullawayJavac {
             + "  }\n"
             + "}\n";
     return new NullawayJavac(
-        Collections.singletonList(new JavaSourceFromString("Test", testClass)), "com.uber", null);
+        Collections.singletonList(new JavaSourceFromString("Test", testClass)),
+        "com.uber",
+        null,
+        Collections.emptyList(),
+        "");
   }
 
   /**
@@ -88,10 +89,17 @@ public class NullawayJavac {
    * @param sourceFileNames absolute paths to the source files to be compiled
    * @param annotatedPackages argument to pass for "-XepOpt:NullAway:AnnotatedPackages" option
    * @param classpath classpath for the benchmark
+   * @param extraErrorProneArgs extra arguments to pass to Error Prone
+   * @param extraProcessorPath additional elements to concatenate to the processor path
    * @throws IOException if a temporary output directory cannot be created
    */
   public static NullawayJavac create(
-      List<String> sourceFileNames, String annotatedPackages, String classpath) throws IOException {
+      List<String> sourceFileNames,
+      String annotatedPackages,
+      String classpath,
+      List<String> extraErrorProneArgs,
+      String extraProcessorPath)
+      throws IOException {
     List<JavaFileObject> compilationUnits = new ArrayList<>();
     for (String sourceFileName : sourceFileNames) {
       // we read every source file into memory in the prepare phase, to avoid some I/O during
@@ -103,7 +111,28 @@ public class NullawayJavac {
       compilationUnits.add(new JavaSourceFromString(classname, content));
     }
 
-    return new NullawayJavac(compilationUnits, annotatedPackages, classpath);
+    return new NullawayJavac(
+        compilationUnits, annotatedPackages, classpath, extraErrorProneArgs, extraProcessorPath);
+  }
+
+  /**
+   * Create a NullawayJavac object to compile a single source file given as a String. This only
+   * supports cases where no additional classpath, Error Prone arguments, or processor path
+   * arguments need to be specified.
+   *
+   * @param className name of the class to compile
+   * @param source source code of the class to compile
+   * @param annotatedPackages argument to pass for "-XepOpt:NullAway:AnnotatedPackages" option
+   * @throws IOException if a temporary output directory cannot be created
+   */
+  public static NullawayJavac createFromSourceString(
+      String className, String source, String annotatedPackages) throws IOException {
+    return new NullawayJavac(
+        Collections.singletonList(new JavaSourceFromString(className, source)),
+        annotatedPackages,
+        null,
+        Collections.emptyList(),
+        "");
   }
 
   /**
@@ -119,10 +148,16 @@ public class NullawayJavac {
    * @param compilationUnits input sources to be compiled
    * @param annotatedPackages argument to pass for "-XepOpt:NullAway:AnnotatedPackages" option
    * @param classpath classpath for the program to be compiled
+   * @param extraErrorProneArgs additional arguments to pass to Error Prone
+   * @param extraProcessorPath additional elements to concatenate to the processor path
    * @throws IOException if a temporary output directory cannot be created
    */
   private NullawayJavac(
-      List<JavaFileObject> compilationUnits, String annotatedPackages, @Nullable String classpath)
+      List<JavaFileObject> compilationUnits,
+      String annotatedPackages,
+      @Nullable String classpath,
+      List<String> extraErrorProneArgs,
+      String extraProcessorPath)
       throws IOException {
     this.compilationUnits = compilationUnits;
     this.compiler = ToolProvider.getSystemJavaCompiler();
@@ -137,17 +172,46 @@ public class NullawayJavac {
     outputDir.toFile().deleteOnExit();
     this.options = new ArrayList<>();
     if (classpath != null) {
-      options.addAll(Arrays.asList("-classpath", classpath));
+      options.addAll(List.of("-classpath", classpath));
     }
+    String processorPath =
+        System.getProperty("java.class.path") + File.pathSeparator + extraProcessorPath;
+    // Error Prone arguments must be passed space separated with -Xplugin:ErrorProne
+    String allErrorProneArgs =
+        String.join(
+            " ",
+            List.of(
+                "-Xplugin:ErrorProne",
+                "-XepDisableAllChecks",
+                "-Xep:NullAway:ERROR",
+                "-XepOpt:NullAway:AnnotatedPackages=" + annotatedPackages,
+                String.join(" ", extraErrorProneArgs)));
     options.addAll(
-        Arrays.asList(
+        List.of(
             "-processorpath",
-            System.getProperty("java.class.path"),
+            processorPath,
             "-d",
             outputDir.toAbsolutePath().toString(),
             "-XDcompilePolicy=simple",
-            "-Xplugin:ErrorProne -XepDisableAllChecks -Xep:NullAway:ERROR -XepOpt:NullAway:AnnotatedPackages="
-                + annotatedPackages));
+            "--should-stop=ifError=FLOW",
+            allErrorProneArgs));
+    // add these options since we have at least one benchmark that only compiles with access to
+    // javac-internal APIs
+    options.addAll(
+        List.of(
+            "--add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED",
+            "--add-exports=jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED",
+            "--add-exports=jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED",
+            "--add-exports=jdk.compiler/com.sun.tools.javac.comp=ALL-UNNAMED",
+            "--add-exports=jdk.compiler/com.sun.tools.javac.main=ALL-UNNAMED",
+            "--add-exports=jdk.compiler/com.sun.tools.javac.model=ALL-UNNAMED",
+            "--add-exports=jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED",
+            "--add-exports=jdk.compiler/com.sun.tools.javac.processing=ALL-UNNAMED",
+            "--add-exports=jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED",
+            "--add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED",
+            "--add-exports=jdk.compiler/com.sun.source.tree=ALL-UNNAMED"));
+    // for JSpecify mode (benign outside JSpecify mode)
+    options.add("-XDaddTypeAnnotationsToSymbol=true");
   }
 
   /**

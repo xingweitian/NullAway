@@ -22,35 +22,50 @@
 
 package com.uber.nullaway;
 
+import com.google.common.base.Joiner;
+import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterables;
 import com.google.errorprone.ErrorProneFlags;
+import com.google.errorprone.util.ASTHelpers;
+import com.sun.tools.javac.code.Symbol;
+import com.uber.nullaway.fixserialization.FixSerializationConfig;
+import com.uber.nullaway.fixserialization.adapters.SerializationAdapter;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.Optional;
 import java.util.Set;
+import java.util.regex.Pattern;
+import org.jspecify.annotations.Nullable;
 
 /**
  * provides nullability configuration based on additional flags passed to ErrorProne via
  * "-XepOpt:[Namespace:]FlagName[=Value]". See. http://errorprone.info/docs/flags
  */
-final class ErrorProneCLIFlagsConfig extends AbstractConfig {
-
-  private static final String BASENAME_REGEX = ".*/([^/]+)\\.[ja]ar$";
+final class ErrorProneCLIFlagsConfig implements Config {
 
   static final String EP_FL_NAMESPACE = "NullAway";
   static final String FL_ANNOTATED_PACKAGES = EP_FL_NAMESPACE + ":AnnotatedPackages";
   static final String FL_ASSERTS_ENABLED = EP_FL_NAMESPACE + ":AssertsEnabled";
   static final String FL_UNANNOTATED_SUBPACKAGES = EP_FL_NAMESPACE + ":UnannotatedSubPackages";
+  static final String FL_ONLY_NULLMARKED = EP_FL_NAMESPACE + ":OnlyNullMarked";
   static final String FL_CLASSES_TO_EXCLUDE = EP_FL_NAMESPACE + ":ExcludedClasses";
   static final String FL_EXHAUSTIVE_OVERRIDE = EP_FL_NAMESPACE + ":ExhaustiveOverride";
   static final String FL_KNOWN_INITIALIZERS = EP_FL_NAMESPACE + ":KnownInitializers";
   static final String FL_CLASS_ANNOTATIONS_TO_EXCLUDE =
       EP_FL_NAMESPACE + ":ExcludedClassAnnotations";
   static final String FL_SUGGEST_SUPPRESSIONS = EP_FL_NAMESPACE + ":SuggestSuppressions";
+
+  static final String FL_CLASS_ANNOTATIONS_GENERATED =
+      EP_FL_NAMESPACE + ":CustomGeneratedCodeAnnotations";
   static final String FL_GENERATED_UNANNOTATED = EP_FL_NAMESPACE + ":TreatGeneratedAsUnannotated";
   static final String FL_ACKNOWLEDGE_ANDROID_RECENT = EP_FL_NAMESPACE + ":AcknowledgeAndroidRecent";
+  static final String FL_JSPECIFY_MODE = EP_FL_NAMESPACE + ":JSpecifyMode";
+  static final String FL_JSPECIFY_EXPERIMENTAL = EP_FL_NAMESPACE + ":JSpecifyExperimental";
   static final String FL_EXCLUDED_FIELD_ANNOT = EP_FL_NAMESPACE + ":ExcludedFieldAnnotations";
   static final String FL_INITIALIZER_ANNOT = EP_FL_NAMESPACE + ":CustomInitializerAnnotations";
+  static final String FL_NULLABLE_ANNOT = EP_FL_NAMESPACE + ":CustomNullableAnnotations";
+  static final String FL_NONNULL_ANNOT = EP_FL_NAMESPACE + ":CustomNonnullAnnotations";
   static final String FL_CTNN_METHOD = EP_FL_NAMESPACE + ":CastToNonNullMethod";
   static final String FL_EXTERNAL_INIT_ANNOT = EP_FL_NAMESPACE + ":ExternalInitAnnotations";
   static final String FL_CONTRACT_ANNOT = EP_FL_NAMESPACE + ":CustomContractAnnotations";
@@ -64,19 +79,56 @@ final class ErrorProneCLIFlagsConfig extends AbstractConfig {
   static final String FL_OPTIONAL_CLASS_PATHS =
       EP_FL_NAMESPACE + ":CheckOptionalEmptinessCustomClasses";
   static final String FL_SUPPRESS_COMMENT = EP_FL_NAMESPACE + ":AutoFixSuppressionComment";
+  static final String FL_SUPPRESS_NAMES = EP_FL_NAMESPACE + ":SuppressionNameAliases";
+
+  static final String FL_SKIP_LIBRARY_MODELS = EP_FL_NAMESPACE + ":IgnoreLibraryModelsFor";
+
+  static final String FL_EXTRA_FUTURES = EP_FL_NAMESPACE + ":ExtraFuturesClasses";
+
   /** --- JarInfer configs --- */
   static final String FL_JI_ENABLED = EP_FL_NAMESPACE + ":JarInferEnabled";
 
-  static final String FL_JI_USE_RETURN = EP_FL_NAMESPACE + ":JarInferUseReturnAnnotations";
+  static final String FL_JSPECIFY_JDK_ENABLED = EP_FL_NAMESPACE + ":JSpecifyJDKModels";
 
-  static final String FL_JI_REGEX_MODEL_PATH = EP_FL_NAMESPACE + ":JarInferRegexStripModelJar";
-  static final String FL_JI_REGEX_CODE_PATH = EP_FL_NAMESPACE + ":JarInferRegexStripCodeJar";
   static final String FL_ERROR_URL = EP_FL_NAMESPACE + ":ErrorURL";
+
+  /** --- Serialization configs --- */
+  static final String FL_FIX_SERIALIZATION = EP_FL_NAMESPACE + ":SerializeFixMetadata";
+
+  static final String FL_FIX_SERIALIZATION_VERSION =
+      EP_FL_NAMESPACE + ":SerializeFixMetadataVersion";
+
+  static final String FL_FIX_SERIALIZATION_CONFIG_PATH =
+      EP_FL_NAMESPACE + ":FixSerializationConfigPath";
+
+  static final String FL_WARN_ON_GENERIC_INFERENCE_FAILURE =
+      EP_FL_NAMESPACE + ":WarnOnGenericInferenceFailure";
+
+  static final String FL_HANDLE_WILDCARD_GENERICS = EP_FL_NAMESPACE + ":HandleWildcardGenerics";
+
+  static final String ANNOTATED_PACKAGES_ONLY_NULLMARKED_ERROR_MSG =
+      "DO NOT report an issue to Error Prone for this crash!  NullAway configuration is "
+          + "incorrect.  "
+          + "Must either specify annotated packages, using the "
+          + "-XepOpt:"
+          + FL_ANNOTATED_PACKAGES
+          + "=[...] flag, or pass -XepOpt:"
+          + FL_ONLY_NULLMARKED
+          + " (but not both).  See https://github.com/uber/NullAway/wiki/Configuration for details. "
+          + "If you feel you have gotten this message in error report an issue"
+          + " at https://github.com/uber/NullAway/issues.";
 
   private static final String DELIMITER = ",";
 
   static final ImmutableSet<String> DEFAULT_CLASS_ANNOTATIONS_TO_EXCLUDE =
       ImmutableSet.of("lombok.Generated");
+
+  // Annotations with simple name ".Generated" need not be manually listed, and are always matched
+  // by default
+  // TODO: org.apache.avro.specific.AvroGenerated should go here, but we are skipping it for the
+  // next release to better test the effect of this feature (users can always manually configure
+  // it).
+  static final ImmutableSet<String> DEFAULT_CLASS_ANNOTATIONS_GENERATED = ImmutableSet.of();
 
   static final ImmutableSet<String> DEFAULT_KNOWN_INITIALIZERS =
       ImmutableSet.of(
@@ -103,10 +155,16 @@ final class ErrorProneCLIFlagsConfig extends AbstractConfig {
           "androidx.fragment.app.Fragment.onActivityCreated",
           "androidx.fragment.app.Fragment.onViewCreated",
           // Multidex app
-          "android.support.multidex.Application.onCreate");
+          "android.support.multidex.Application.onCreate",
+          // Apache Flink
+          // See docs:
+          // https://nightlies.apache.org/flink/flink-docs-master/api/java/org/apache/flink/api/common/functions/RichFunction.html#open-org.apache.flink.api.common.functions.OpenContext-
+          "org.apache.flink.api.common.functions.RichFunction.open");
 
   static final ImmutableSet<String> DEFAULT_INITIALIZER_ANNOT =
       ImmutableSet.of(
+          "jakarta.annotation.PostConstruct",
+          "javax.annotation.PostConstruct",
           "org.junit.Before",
           "org.junit.BeforeClass",
           "org.junit.jupiter.api.BeforeAll",
@@ -124,34 +182,121 @@ final class ErrorProneCLIFlagsConfig extends AbstractConfig {
           "jakarta.inject.Inject", // no explicit initialization when there is dependency injection
           "javax.inject.Inject", // no explicit initialization when there is dependency injection
           "com.google.errorprone.annotations.concurrent.LazyInit",
-          "org.checkerframework.checker.nullness.qual.MonotonicNonNull",
-          "org.springframework.beans.factory.annotation.Autowired");
+          "org.apache.maven.plugins.annotations.Parameter",
+          "org.mockito.Captor",
+          "org.mockito.InjectMocks",
+          "org.mockito.Mock",
+          "org.mockito.Spy",
+          "org.springframework.beans.factory.annotation.Autowired",
+          "org.springframework.boot.test.mock.mockito.MockBean",
+          "org.springframework.boot.test.mock.mockito.SpyBean",
+          "org.springframework.test.context.bean.override.mockito.MockitoBean",
+          "org.springframework.test.context.bean.override.mockito.MockitoSpyBean",
+          "org.wiremock.spring.InjectWireMock",
+          "org.junit.jupiter.api.io.TempDir",
+          "org.assertj.core.api.junit.jupiter.InjectSoftAssertions");
 
   private static final String DEFAULT_URL = "http://t.uber.com/nullaway";
 
+  /**
+   * Packages that we assume have appropriate nullability annotations.
+   *
+   * <p>When we see an invocation to a method of a class outside these packages, we optimistically
+   * assume all parameters are @Nullable and the return value is @NonNull
+   */
+  private final Pattern annotatedPackages;
+
+  /**
+   * Sub-packages without appropriate nullability annotations.
+   *
+   * <p>Used to exclude a particular package that contains unannotated code within a larger,
+   * properly annotated, package.
+   */
+  private final Pattern unannotatedSubPackages;
+
+  /** Source code in these classes will not be analyzed for nullability issues */
+  private final @Nullable ImmutableSet<String> sourceClassesToExclude;
+
+  /**
+   * these classes will be treated as unannotated (don't analyze *and* treat methods as unannotated)
+   */
+  private final @Nullable ImmutableSet<String> unannotatedClasses;
+
+  private final Pattern fieldAnnotPattern;
+  private final boolean isExhaustiveOverride;
+  private final boolean isSuggestSuppressions;
+  private final boolean isAcknowledgeRestrictive;
+  private final boolean checkOptionalEmptiness;
+  private final boolean checkContracts;
+  private final boolean handleTestAssertionLibraries;
+  private final ImmutableSet<String> optionalClassPaths;
+  private final boolean assertsEnabled;
+  private final boolean treatGeneratedAsUnannotated;
+  private final boolean acknowledgeAndroidRecent;
+  private final boolean jspecifyMode;
+  private final boolean polyNullLibraryModelsEnabled;
+  private final boolean handleWildcardGenerics;
+  private final boolean warnOnInferenceFailure;
+  private final ImmutableSet<MethodClassAndName> knownInitializers;
+  private final ImmutableSet<String> excludedClassAnnotations;
+  private final ImmutableSet<String> generatedCodeAnnotations;
+  private final ImmutableSet<String> initializerAnnotations;
+  private final ImmutableSet<String> externalInitAnnotations;
+  private final ImmutableSet<String> contractAnnotations;
+  private final @Nullable String castToNonNullMethod;
+  private final String autofixSuppressionComment;
+  private final ImmutableSet<String> suppressionNameAliases;
+  private final ImmutableSet<String> skippedLibraryModels;
+  private final ImmutableSet<String> extraFuturesClasses;
+
+  /** --- JarInfer configs --- */
+  private final boolean jarInferEnabled;
+
+  private final boolean jspecifyJDKModelsEnabled;
+
+  private final String errorURL;
+
+  /** --- Fully qualified names of custom nonnull/nullable annotation --- */
+  private final ImmutableSet<String> customNonnullAnnotations;
+
+  private final ImmutableSet<String> customNullableAnnotations;
+
+  /**
+   * If active, NullAway will write all reporting errors in output directory. The output directory
+   * along with the activation status of other serialization features are stored in {@link
+   * FixSerializationConfig}.
+   */
+  private final boolean serializationActivationFlag;
+
+  private final FixSerializationConfig fixSerializationConfig;
+
   ErrorProneCLIFlagsConfig(ErrorProneFlags flags) {
-    if (!flags.get(FL_ANNOTATED_PACKAGES).isPresent()) {
-      throw new IllegalStateException(
-          "DO NOT report an issue to Error Prone for this crash!  NullAway configuration is "
-              + "incorrect.  "
-              + "Must specify annotated packages, using the "
-              + "-XepOpt:"
-              + FL_ANNOTATED_PACKAGES
-              + "=[...] flag.  If you feel you have gotten this message in error report an issue"
-              + " at https://github.com/uber/NullAway/issues.");
+    boolean jspecifyExperimental = flags.getBoolean(FL_JSPECIFY_EXPERIMENTAL).orElse(false);
+    boolean annotatedPackagesPassed = flags.get(FL_ANNOTATED_PACKAGES).isPresent();
+    boolean onlyNullMarked = flags.getBoolean(FL_ONLY_NULLMARKED).orElse(false);
+    // exactly one of AnnotatedPackages or OnlyNullMarked should be passed in
+    if ((!annotatedPackagesPassed && !onlyNullMarked)
+        || (annotatedPackagesPassed && onlyNullMarked)) {
+      throw new IllegalStateException(ANNOTATED_PACKAGES_ONLY_NULLMARKED_ERROR_MSG);
     }
     annotatedPackages = getPackagePattern(getFlagStringSet(flags, FL_ANNOTATED_PACKAGES));
     unannotatedSubPackages = getPackagePattern(getFlagStringSet(flags, FL_UNANNOTATED_SUBPACKAGES));
     sourceClassesToExclude = getFlagStringSet(flags, FL_CLASSES_TO_EXCLUDE);
     unannotatedClasses = getFlagStringSet(flags, FL_UNANNOTATED_CLASSES);
     knownInitializers =
-        getKnownInitializers(
-            getFlagStringSet(flags, FL_KNOWN_INITIALIZERS, DEFAULT_KNOWN_INITIALIZERS));
+        getFlagStringSet(flags, FL_KNOWN_INITIALIZERS, DEFAULT_KNOWN_INITIALIZERS).stream()
+            .map(MethodClassAndName::fromClassDotMethod)
+            .collect(ImmutableSet.toImmutableSet());
     excludedClassAnnotations =
         getFlagStringSet(
             flags, FL_CLASS_ANNOTATIONS_TO_EXCLUDE, DEFAULT_CLASS_ANNOTATIONS_TO_EXCLUDE);
+    generatedCodeAnnotations =
+        getFlagStringSet(
+            flags, FL_CLASS_ANNOTATIONS_GENERATED, DEFAULT_CLASS_ANNOTATIONS_GENERATED);
     initializerAnnotations =
         getFlagStringSet(flags, FL_INITIALIZER_ANNOT, DEFAULT_INITIALIZER_ANNOT);
+    customNullableAnnotations = getFlagStringSet(flags, FL_NULLABLE_ANNOT, ImmutableSet.of());
+    customNonnullAnnotations = getFlagStringSet(flags, FL_NONNULL_ANNOT, ImmutableSet.of());
     externalInitAnnotations =
         getFlagStringSet(flags, FL_EXTERNAL_INIT_ANNOT, DEFAULT_EXTERNAL_INIT_ANNOT);
     contractAnnotations = getFlagStringSet(flags, FL_CONTRACT_ANNOT, DEFAULT_CONTRACT_ANNOT);
@@ -164,11 +309,17 @@ final class ErrorProneCLIFlagsConfig extends AbstractConfig {
         flags.getBoolean(FL_HANDLE_TEST_ASSERTION_LIBRARIES).orElse(false);
     treatGeneratedAsUnannotated = flags.getBoolean(FL_GENERATED_UNANNOTATED).orElse(false);
     acknowledgeAndroidRecent = flags.getBoolean(FL_ACKNOWLEDGE_ANDROID_RECENT).orElse(false);
+    jspecifyMode = flags.getBoolean(FL_JSPECIFY_MODE).orElse(false);
+    polyNullLibraryModelsEnabled = jspecifyMode && jspecifyExperimental;
+    handleWildcardGenerics =
+        flags.getBoolean(FL_HANDLE_WILDCARD_GENERICS).orElse(jspecifyExperimental);
     assertsEnabled = flags.getBoolean(FL_ASSERTS_ENABLED).orElse(false);
     fieldAnnotPattern =
         getPackagePattern(
             getFlagStringSet(flags, FL_EXCLUDED_FIELD_ANNOT, DEFAULT_EXCLUDED_FIELD_ANNOT));
     castToNonNullMethod = flags.get(FL_CTNN_METHOD).orElse(null);
+    warnOnInferenceFailure =
+        flags.getBoolean(FL_WARN_ON_GENERIC_INFERENCE_FAILURE).orElse(jspecifyExperimental);
     autofixSuppressionComment = flags.get(FL_SUPPRESS_COMMENT).orElse("");
     optionalClassPaths =
         new ImmutableSet.Builder<String>()
@@ -179,14 +330,18 @@ final class ErrorProneCLIFlagsConfig extends AbstractConfig {
       throw new IllegalStateException(
           "Invalid -XepOpt:" + FL_SUPPRESS_COMMENT + " value. Comment must be single line.");
     }
-    /** --- JarInfer configs --- */
+    suppressionNameAliases = getFlagStringSet(flags, FL_SUPPRESS_NAMES);
+    skippedLibraryModels = getFlagStringSet(flags, FL_SKIP_LIBRARY_MODELS);
+    extraFuturesClasses = getFlagStringSet(flags, FL_EXTRA_FUTURES);
+
+    /* --- JarInfer configs --- */
     jarInferEnabled = flags.getBoolean(FL_JI_ENABLED).orElse(false);
-    jarInferUseReturnAnnotations = flags.getBoolean(FL_JI_USE_RETURN).orElse(false);
-    // The defaults of these two options translate to: remove .aar/.jar from the file name, and also
-    // implicitly mean that NullAway will search for jarinfer models in the same jar which contains
-    // the analyzed classes.
-    jarInferRegexStripModelJarName = flags.get(FL_JI_REGEX_MODEL_PATH).orElse(BASENAME_REGEX);
-    jarInferRegexStripCodeJarName = flags.get(FL_JI_REGEX_CODE_PATH).orElse(BASENAME_REGEX);
+    jspecifyJDKModelsEnabled =
+        flags.getBoolean(FL_JSPECIFY_JDK_ENABLED).orElse(jspecifyExperimental);
+    if (jspecifyJDKModelsEnabled && !jspecifyMode) {
+      throw new IllegalStateException(
+          "-XepOpt:%s should only be set in JSpecify mode".formatted(FL_JSPECIFY_JDK_ENABLED));
+    }
     errorURL = flags.get(FL_ERROR_URL).orElse(DEFAULT_URL);
     if (acknowledgeAndroidRecent && !isAcknowledgeRestrictive) {
       throw new IllegalStateException(
@@ -195,6 +350,37 @@ final class ErrorProneCLIFlagsConfig extends AbstractConfig {
               + " should only be set when -XepOpt:"
               + FL_ACKNOWLEDGE_RESTRICTIVE
               + " is also set");
+    }
+    serializationActivationFlag = flags.getBoolean(FL_FIX_SERIALIZATION).orElse(false);
+    Optional<String> fixSerializationConfigPath = flags.get(FL_FIX_SERIALIZATION_CONFIG_PATH);
+    if (serializationActivationFlag && !fixSerializationConfigPath.isPresent()) {
+      throw new IllegalStateException(
+          "DO NOT report an issue to Error Prone for this crash!  NullAway Fix Serialization configuration is "
+              + "incorrect.  "
+              + "Must specify AutoFixer Output Directory, using the "
+              + "-XepOpt:"
+              + FL_FIX_SERIALIZATION_CONFIG_PATH
+              + " flag.  If you feel you have gotten this message in error report an issue"
+              + " at https://github.com/uber/NullAway/issues.");
+    }
+    int serializationVersion =
+        flags.getInteger(FL_FIX_SERIALIZATION_VERSION).orElse(SerializationAdapter.LATEST_VERSION);
+    /*
+     * if fixSerializationActivationFlag is false, the default constructor is invoked for
+     * creating FixSerializationConfig which all features are deactivated.  This lets the
+     * field be @Nonnull, allowing us to avoid null checks in various places.
+     */
+    fixSerializationConfig =
+        serializationActivationFlag && fixSerializationConfigPath.isPresent()
+            ? new FixSerializationConfig(fixSerializationConfigPath.get(), serializationVersion)
+            : new FixSerializationConfig();
+    if (serializationActivationFlag && isSuggestSuppressions) {
+      throw new IllegalStateException(
+          "In order to activate Fix Serialization mode ("
+              + FL_FIX_SERIALIZATION
+              + "), Suggest Suppressions mode must be deactivated ("
+              + FL_SUGGEST_SUPPRESSIONS
+              + ")");
     }
   }
 
@@ -214,5 +400,251 @@ final class ErrorProneCLIFlagsConfig extends AbstractConfig {
       Collections.addAll(combined, flagValue.get().split(DELIMITER));
     }
     return ImmutableSet.copyOf(combined);
+  }
+
+  private static final Pattern getPackagePattern(ImmutableSet<String> packagePrefixes) {
+    // noinspection ConstantConditions
+    String choiceRegexp =
+        Joiner.on("|")
+            .join(Iterables.transform(packagePrefixes, input -> input.replaceAll("\\.", "\\\\.")));
+    return Pattern.compile("^(?:" + choiceRegexp + ")(?:\\..*)?");
+  }
+
+  @Override
+  public boolean serializationIsActive() {
+    return serializationActivationFlag;
+  }
+
+  @Override
+  public FixSerializationConfig getSerializationConfig() {
+    Preconditions.checkArgument(
+        serializationActivationFlag, "Fix Serialization is not active, cannot access it's config.");
+    return fixSerializationConfig;
+  }
+
+  @Override
+  public boolean fromExplicitlyAnnotatedPackage(String className) {
+    return annotatedPackages.matcher(className).matches();
+  }
+
+  @Override
+  public boolean fromExplicitlyUnannotatedPackage(String className) {
+    return unannotatedSubPackages.matcher(className).matches();
+  }
+
+  @Override
+  public boolean treatGeneratedAsUnannotated() {
+    return treatGeneratedAsUnannotated;
+  }
+
+  @Override
+  public boolean isExcludedClass(String className) {
+    if (sourceClassesToExclude == null) {
+      return false;
+    }
+    for (String classPrefix : sourceClassesToExclude) {
+      if (className.startsWith(classPrefix)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  @Override
+  public boolean isUnannotatedClass(Symbol.ClassSymbol symbol) {
+    if (unannotatedClasses == null) {
+      return false;
+    }
+    String className = symbol.getQualifiedName().toString();
+    for (String classPrefix : unannotatedClasses) {
+      if (className.startsWith(classPrefix)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  @Override
+  public ImmutableSet<String> getExcludedClassAnnotations() {
+    return excludedClassAnnotations;
+  }
+
+  @Override
+  public ImmutableSet<String> getGeneratedCodeAnnotations() {
+    return generatedCodeAnnotations;
+  }
+
+  @Override
+  public boolean isInitializerMethodAnnotation(String annotationName) {
+    return initializerAnnotations.contains(annotationName);
+  }
+
+  @Override
+  public boolean isCustomNullableAnnotation(String annotationName) {
+    return customNullableAnnotations.contains(annotationName);
+  }
+
+  @Override
+  public boolean isCustomNonnullAnnotation(String annotationName) {
+    return customNonnullAnnotations.contains(annotationName);
+  }
+
+  @Override
+  public boolean exhaustiveOverride() {
+    return isExhaustiveOverride;
+  }
+
+  @Override
+  public boolean isKnownInitializerMethod(Symbol.MethodSymbol methodSymbol) {
+    Symbol.ClassSymbol enclosingClass = ASTHelpers.enclosingClass(methodSymbol);
+    if (enclosingClass == null) {
+      return false;
+    }
+    MethodClassAndName classAndName =
+        MethodClassAndName.create(
+            enclosingClass.getQualifiedName().toString(), methodSymbol.getSimpleName().toString());
+    return knownInitializers.contains(classAndName);
+  }
+
+  /**
+   * NOTE: this checks not only for excluded field annotations according to the config, but also for
+   * a {@code @Nullable} annotation or a {@code @MonotonicNonNull} annotation.
+   */
+  @Override
+  public boolean isExcludedFieldAnnotation(String annotationName) {
+    return Nullness.isNullableAnnotation(annotationName, this)
+        || Nullness.isMonotonicNonNullAnnotation(annotationName)
+        || (fieldAnnotPattern != null && fieldAnnotPattern.matcher(annotationName).matches());
+  }
+
+  @Override
+  public boolean suggestSuppressions() {
+    return isSuggestSuppressions;
+  }
+
+  @Override
+  public boolean acknowledgeRestrictiveAnnotations() {
+    // restrictive annotations must always be acknowledged in JSpecify mode
+    return isAcknowledgeRestrictive || jspecifyMode;
+  }
+
+  @Override
+  public boolean checkOptionalEmptiness() {
+    return checkOptionalEmptiness;
+  }
+
+  @Override
+  public boolean checkContracts() {
+    return checkContracts;
+  }
+
+  @Override
+  public boolean handleTestAssertionLibraries() {
+    return handleTestAssertionLibraries;
+  }
+
+  @Override
+  public ImmutableSet<String> getOptionalClassPaths() {
+    return optionalClassPaths;
+  }
+
+  @Override
+  public boolean assertsEnabled() {
+    return assertsEnabled;
+  }
+
+  @Override
+  public @Nullable String getCastToNonNullMethod() {
+    return castToNonNullMethod;
+  }
+
+  @Override
+  public ImmutableSet<String> getSuppressionNameAliases() {
+    return suppressionNameAliases;
+  }
+
+  @Override
+  public String getAutofixSuppressionComment() {
+    if (autofixSuppressionComment.trim().length() > 0) {
+      return "/* " + autofixSuppressionComment + " */ ";
+    } else {
+      return "";
+    }
+  }
+
+  @Override
+  public boolean isExternalInitClassAnnotation(String annotationName) {
+    return externalInitAnnotations.contains(annotationName);
+  }
+
+  @Override
+  public boolean isContractAnnotation(String annotationName) {
+    return contractAnnotations.contains(annotationName);
+  }
+
+  @Override
+  public boolean isSkippedLibraryModel(String classDotMethod) {
+    return skippedLibraryModels.contains(classDotMethod);
+  }
+
+  @Override
+  public ImmutableSet<String> getExtraFuturesClasses() {
+    return extraFuturesClasses;
+  }
+
+  /** --- JarInfer configs --- */
+  @Override
+  public boolean isJarInferEnabled() {
+    return jarInferEnabled;
+  }
+
+  @Override
+  public boolean isJSpecifyJDKModels() {
+    return jspecifyJDKModelsEnabled;
+  }
+
+  @Override
+  public String getErrorURL() {
+    return errorURL;
+  }
+
+  @Override
+  public boolean acknowledgeAndroidRecent() {
+    return acknowledgeAndroidRecent;
+  }
+
+  @Override
+  public boolean isJSpecifyMode() {
+    return jspecifyMode;
+  }
+
+  /** Returns true iff the JSpecifyMode and JSpecifyExperimental flags have both been set */
+  @Override
+  public boolean isPolyNullLibraryModelsEnabled() {
+    return polyNullLibraryModelsEnabled;
+  }
+
+  @Override
+  public boolean handleWildcardGenerics() {
+    return handleWildcardGenerics;
+  }
+
+  @Override
+  public boolean warnOnGenericInferenceFailure() {
+    return warnOnInferenceFailure;
+  }
+
+  record MethodClassAndName(String enclosingClass, String methodName) {
+
+    static MethodClassAndName create(String enclosingClass, String methodName) {
+      return new MethodClassAndName(enclosingClass, methodName);
+    }
+
+    static MethodClassAndName fromClassDotMethod(String classDotMethod) {
+      int lastDot = classDotMethod.lastIndexOf('.');
+      String methodName = classDotMethod.substring(lastDot + 1);
+      String className = classDotMethod.substring(0, lastDot);
+      return MethodClassAndName.create(className, methodName);
+    }
   }
 }

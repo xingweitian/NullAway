@@ -22,9 +22,14 @@ package com.uber.nullaway.handlers;
  * THE SOFTWARE.
  */
 
+import com.google.errorprone.VisitorState;
+import com.google.errorprone.suppliers.Supplier;
+import com.google.errorprone.suppliers.Suppliers;
 import com.google.errorprone.util.ASTHelpers;
 import com.sun.tools.javac.code.Symbol;
+import com.sun.tools.javac.code.Type;
 import com.sun.tools.javac.util.Name;
+import com.uber.nullaway.annotations.Initializer;
 import org.checkerframework.nullaway.dataflow.cfg.node.MethodInvocationNode;
 import org.checkerframework.nullaway.dataflow.cfg.node.Node;
 
@@ -39,80 +44,202 @@ class MethodNameUtil {
   // Strings corresponding to the names of the methods (and their owners) used to identify
   // assertions in this handler.
   private static final String IS_NOT_NULL_METHOD = "isNotNull";
-  private static final String IS_NOT_NULL_OWNER = "com.google.common.truth.Subject";
+  private static final String IS_HAS_SIZE_METHOD = "hasSize";
+  private static final String IS_OWNER_TRUTH_SUBJECT = "com.google.common.truth.Subject";
+  private static final String IS_INSTANCE_OF_METHOD = "isInstanceOf";
+  private static final String IS_INSTANCE_OF_ANY_METHOD = "isInstanceOfAny";
   private static final String IS_TRUE_METHOD = "isTrue";
-  private static final String IS_TRUE_OWNER = "com.google.common.truth.BooleanSubject";
+  private static final String IS_FALSE_METHOD = "isFalse";
+  private static final String IS_TRUE_OWNER_TRUTH = "com.google.common.truth.BooleanSubject";
+  private static final String IS_TRUE_OWNER_ASSERTJ = "org.assertj.core.api.AbstractBooleanAssert";
+  private static final String BOOLEAN_VALUE_OF_METHOD = "valueOf";
+  private static final String BOOLEAN_VALUE_OF_OWNER = "java.lang.Boolean";
+  private static final String IS_PRESENT_METHOD = "isPresent";
+  private static final String IS_NOT_EMPTY_METHOD = "isNotEmpty";
+  private static final String IS_PRESENT_OWNER_ASSERTJ =
+      "org.assertj.core.api.AbstractOptionalAssert";
   private static final String ASSERT_THAT_METHOD = "assertThat";
-  private static final String ASSERT_THAT_OWNER = "com.google.common.truth.Truth";
+  private static final String AS_METHOD = "as";
+  private static final String DESCRIBED_AS_METHOD = "describedAs";
+
+  private static final String ASSERT_THAT_OWNER_TRUTH = "com.google.common.truth.Truth";
+  private static final String ASSERT_THAT_OWNER_ASSERTJ = "org.assertj.core.api.Assertions";
 
   private static final String HAMCREST_ASSERT_CLASS = "org.hamcrest.MatcherAssert";
   private static final String JUNIT_ASSERT_CLASS = "org.junit.Assert";
+  private static final String JUNIT5_ASSERTION_CLASS = "org.junit.jupiter.api.Assertions";
+
+  private static final String ASSERT_TRUE_METHOD = "assertTrue";
+  private static final String ASSERT_FALSE_METHOD = "assertFalse";
 
   private static final String MATCHERS_CLASS = "org.hamcrest.Matchers";
   private static final String CORE_MATCHERS_CLASS = "org.hamcrest.CoreMatchers";
   private static final String CORE_IS_NULL_CLASS = "org.hamcrest.core.IsNull";
   private static final String IS_MATCHER = "is";
+  private static final String IS_A_MATCHER = "isA";
   private static final String NOT_MATCHER = "not";
   private static final String NOT_NULL_VALUE_MATCHER = "notNullValue";
   private static final String NULL_VALUE_MATCHER = "nullValue";
+  private static final String INSTANCE_OF_MATCHER = "instanceOf";
+
+  private static final Supplier<Type> ASSERTJ_ASSERT_TYPE_SUPPLIER =
+      Suppliers.typeFromString("org.assertj.core.api.Assert");
 
   // Names of the methods (and their owners) used to identify assertions in this handler. Name used
   // here refers to com.sun.tools.javac.util.Name. Comparing methods using Names is faster than
   // comparing using strings.
   private Name isNotNull;
-  private Name isNotNullOwner;
+  private Name hasSize;
+
+  private Name isInstanceOf;
+  private Name isInstanceOfAny;
+  private Name isOwnerTruthSubject;
 
   private Name isTrue;
-  private Name isTrueOwner;
+  private Name isFalse;
+  private Name isTrueOwnerTruth;
+  private Name isTrueOwnerAssertJ;
+  private Name isPresent;
+  private Name isNotEmpty;
+  private Name isPresentOwnerAssertJ;
+
+  private Name isBooleanValueOfMethod;
+  private Name isBooleanValueOfOwner;
 
   private Name assertThat;
-  private Name assertThatOwner;
+  private Name assertThatOwnerTruth;
+  private Name assertThatOwnerAssertJ;
+
+  private Name as;
+  private Name describedAs;
 
   // Names for junit assertion libraries.
   private Name hamcrestAssertClass;
   private Name junitAssertClass;
+  private Name junit5AssertionClass;
+
+  private Name assertTrue;
+  private Name assertFalse;
 
   // Names for hamcrest matchers.
   private Name matchersClass;
   private Name coreMatchersClass;
   private Name coreIsNullClass;
   private Name isMatcher;
+  private Name isAMatcher;
   private Name notMatcher;
   private Name notNullValueMatcher;
   private Name nullValueMatcher;
+  private Name instanceOfMatcher;
 
+  @Initializer
   void initializeMethodNames(Name.Table table) {
     isNotNull = table.fromString(IS_NOT_NULL_METHOD);
-    isNotNullOwner = table.fromString(IS_NOT_NULL_OWNER);
+    hasSize = table.fromString(IS_HAS_SIZE_METHOD);
+    isOwnerTruthSubject = table.fromString(IS_OWNER_TRUTH_SUBJECT);
+
+    isInstanceOf = table.fromString(IS_INSTANCE_OF_METHOD);
+    isInstanceOfAny = table.fromString(IS_INSTANCE_OF_ANY_METHOD);
 
     isTrue = table.fromString(IS_TRUE_METHOD);
-    isTrueOwner = table.fromString(IS_TRUE_OWNER);
+    isFalse = table.fromString(IS_FALSE_METHOD);
+    isTrueOwnerTruth = table.fromString(IS_TRUE_OWNER_TRUTH);
+    isTrueOwnerAssertJ = table.fromString(IS_TRUE_OWNER_ASSERTJ);
+
+    isBooleanValueOfMethod = table.fromString(BOOLEAN_VALUE_OF_METHOD);
+    isBooleanValueOfOwner = table.fromString(BOOLEAN_VALUE_OF_OWNER);
 
     assertThat = table.fromString(ASSERT_THAT_METHOD);
-    assertThatOwner = table.fromString(ASSERT_THAT_OWNER);
+    assertThatOwnerTruth = table.fromString(ASSERT_THAT_OWNER_TRUTH);
+    assertThatOwnerAssertJ = table.fromString(ASSERT_THAT_OWNER_ASSERTJ);
+
+    as = table.fromString(AS_METHOD);
+    describedAs = table.fromString(DESCRIBED_AS_METHOD);
+
+    isPresent = table.fromString(IS_PRESENT_METHOD);
+    isNotEmpty = table.fromString(IS_NOT_EMPTY_METHOD);
+    isPresentOwnerAssertJ = table.fromString(IS_PRESENT_OWNER_ASSERTJ);
 
     hamcrestAssertClass = table.fromString(HAMCREST_ASSERT_CLASS);
     junitAssertClass = table.fromString(JUNIT_ASSERT_CLASS);
+    junit5AssertionClass = table.fromString(JUNIT5_ASSERTION_CLASS);
+
+    assertTrue = table.fromString(ASSERT_TRUE_METHOD);
+    assertFalse = table.fromString(ASSERT_FALSE_METHOD);
 
     matchersClass = table.fromString(MATCHERS_CLASS);
     coreMatchersClass = table.fromString(CORE_MATCHERS_CLASS);
     coreIsNullClass = table.fromString(CORE_IS_NULL_CLASS);
     isMatcher = table.fromString(IS_MATCHER);
+    isAMatcher = table.fromString(IS_A_MATCHER);
     notMatcher = table.fromString(NOT_MATCHER);
     notNullValueMatcher = table.fromString(NOT_NULL_VALUE_MATCHER);
     nullValueMatcher = table.fromString(NULL_VALUE_MATCHER);
+    instanceOfMatcher = table.fromString(INSTANCE_OF_MATCHER);
   }
 
-  boolean isMethodIsNotNull(Symbol.MethodSymbol methodSymbol) {
-    return matchesMethod(methodSymbol, isNotNull, isNotNullOwner);
+  boolean isMethodIsNotNull(Symbol.MethodSymbol methodSymbol, VisitorState state) {
+    return matchesMethod(methodSymbol, isNotNull, isOwnerTruthSubject)
+        || matchesAssertJAssertMethod(methodSymbol, isNotNull, state);
+  }
+
+  boolean isMethodHasSize(Symbol.MethodSymbol methodSymbol, VisitorState state) {
+    return matchesAssertJAssertMethod(methodSymbol, hasSize, state);
+  }
+
+  boolean isMethodIsInstanceOf(Symbol.MethodSymbol methodSymbol, VisitorState state) {
+    return matchesMethod(methodSymbol, isInstanceOf, isOwnerTruthSubject)
+        || matchesAssertJAssertMethod(methodSymbol, isInstanceOf, state)
+        // Truth doesn't seem to have isInstanceOfAny
+        || matchesAssertJAssertMethod(methodSymbol, isInstanceOfAny, state);
+  }
+
+  boolean isMethodAssertTrue(Symbol.MethodSymbol methodSymbol) {
+    return matchesMethod(methodSymbol, assertTrue, junitAssertClass)
+        || matchesMethod(methodSymbol, assertTrue, junit5AssertionClass);
+  }
+
+  boolean isMethodAssertFalse(Symbol.MethodSymbol methodSymbol) {
+    return matchesMethod(methodSymbol, assertFalse, junitAssertClass)
+        || matchesMethod(methodSymbol, assertFalse, junit5AssertionClass);
+  }
+
+  boolean isMethodThatEnsuresOptionalPresent(Symbol.MethodSymbol methodSymbol) {
+    // same owner
+    return matchesMethod(methodSymbol, isPresent, isPresentOwnerAssertJ)
+        || matchesMethod(methodSymbol, isNotEmpty, isPresentOwnerAssertJ);
   }
 
   boolean isMethodIsTrue(Symbol.MethodSymbol methodSymbol) {
-    return matchesMethod(methodSymbol, isTrue, isTrueOwner);
+    return matchesMethod(methodSymbol, isTrue, isTrueOwnerTruth)
+        || matchesMethod(methodSymbol, isTrue, isTrueOwnerAssertJ);
+  }
+
+  boolean isMethodIsFalse(Symbol.MethodSymbol methodSymbol) {
+    // same owners as isTrue
+    return matchesMethod(methodSymbol, isFalse, isTrueOwnerTruth)
+        || matchesMethod(methodSymbol, isFalse, isTrueOwnerAssertJ);
+  }
+
+  boolean isMethodBooleanValueOf(Symbol.MethodSymbol methodSymbol) {
+    return matchesMethod(methodSymbol, isBooleanValueOfMethod, isBooleanValueOfOwner);
   }
 
   boolean isMethodAssertThat(Symbol.MethodSymbol methodSymbol) {
-    return matchesMethod(methodSymbol, assertThat, assertThatOwner);
+    return matchesMethod(methodSymbol, assertThat, assertThatOwnerTruth)
+        || matchesMethod(methodSymbol, assertThat, assertThatOwnerAssertJ);
+  }
+
+  /**
+   * Returns true if the method is describedAs() or as() from AssertJ. Note that this implementation
+   * does not check the ower, as there are many possible implementations. This method should only be
+   * used in a caller content where it is clear that the operation is related to use of AssertJ.
+   *
+   * @param methodSymbol symbol for the method
+   * @return {@code true} iff the method is describedAs() or as() from AssertJ
+   */
+  public boolean isMethodAssertJDescribedAs(Symbol.MethodSymbol methodSymbol) {
+    return methodSymbol.name.equals(as) || methodSymbol.name.equals(describedAs);
   }
 
   boolean isMethodHamcrestAssertThat(Symbol.MethodSymbol methodSymbol) {
@@ -156,9 +283,23 @@ class MethodNameUtil {
         || matchesMatcherMethod(node, nullValueMatcher, coreIsNullClass);
   }
 
+  boolean isMatcherIsInstanceOf(Node node) {
+    // Matches with
+    //   * is(instanceOf(Some.class))
+    //   * isA(Some.class)
+    if (matchesMatcherMethod(node, isMatcher, matchersClass)
+        || matchesMatcherMethod(node, isMatcher, coreMatchersClass)) {
+      // All overloads of `is` method have exactly one argument.
+      Node inner = ((MethodInvocationNode) node).getArgument(0);
+      return matchesMatcherMethod(inner, instanceOfMatcher, matchersClass)
+          || matchesMatcherMethod(inner, instanceOfMatcher, coreMatchersClass);
+    }
+    return (matchesMatcherMethod(node, isAMatcher, matchersClass)
+        || matchesMatcherMethod(node, isAMatcher, coreMatchersClass));
+  }
+
   private boolean matchesMatcherMethod(Node node, Name matcherName, Name matcherClass) {
-    if (node instanceof MethodInvocationNode) {
-      MethodInvocationNode methodInvocationNode = (MethodInvocationNode) node;
+    if (node instanceof MethodInvocationNode methodInvocationNode) {
       Symbol.MethodSymbol callee = ASTHelpers.getSymbol(methodInvocationNode.getTree());
       return matchesMethod(callee, matcherName, matcherClass);
     }
@@ -169,6 +310,24 @@ class MethodNameUtil {
       Symbol.MethodSymbol methodSymbol, Name toMatchMethodName, Name toMatchOwnerName) {
     return methodSymbol.name.equals(toMatchMethodName)
         && methodSymbol.owner.getQualifiedName().equals(toMatchOwnerName);
+  }
+
+  /**
+   * Checks if the method is an AssertJ assert method, i.e., it has the same name as
+   * toMatchMethodName and its owner is a subtype of AssertJ's Assert class.
+   *
+   * @param methodSymbol the method symbol to check
+   * @param toMatchMethodName the method name to match
+   * @param state the visitor state
+   * @return {@code true} if the method matches, {@code false} otherwise
+   */
+  private boolean matchesAssertJAssertMethod(
+      Symbol.MethodSymbol methodSymbol, Name toMatchMethodName, VisitorState state) {
+    if (!methodSymbol.name.equals(toMatchMethodName)) {
+      return false;
+    }
+    return ASTHelpers.isSubtype(
+        methodSymbol.owner.type, ASSERTJ_ASSERT_TYPE_SUPPLIER.get(state), state);
   }
 
   boolean isUtilInitialized() {

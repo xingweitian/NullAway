@@ -27,7 +27,9 @@ import com.uber.nullaway.Config;
 import com.uber.nullaway.handlers.contract.ContractCheckHandler;
 import com.uber.nullaway.handlers.contract.ContractHandler;
 import com.uber.nullaway.handlers.contract.fieldcontract.EnsuresNonNullHandler;
+import com.uber.nullaway.handlers.contract.fieldcontract.EnsuresNonNullIfHandler;
 import com.uber.nullaway.handlers.contract.fieldcontract.RequiresNonNullHandler;
+import com.uber.nullaway.handlers.temporary.FluentFutureHandler;
 
 /** Utility static methods for the handlers package. */
 public class Handlers {
@@ -42,35 +44,62 @@ public class Handlers {
    */
   public static Handler buildDefault(Config config) {
     ImmutableList.Builder<Handler> handlerListBuilder = ImmutableList.builder();
-    final MethodNameUtil methodNameUtil = new MethodNameUtil();
+    MethodNameUtil methodNameUtil = new MethodNameUtil();
 
+    RestrictiveAnnotationHandler restrictiveAnnotationHandler = null;
     if (config.acknowledgeRestrictiveAnnotations()) {
       // This runs before LibraryModelsHandler, so that library models can override third-party
       // bytecode annotations
-      handlerListBuilder.add(new RestrictiveAnnotationHandler(config));
-    }
-    if (config.isJarInferEnabled()) {
-      handlerListBuilder.add(new InferredJARModelsHandler(config));
+      restrictiveAnnotationHandler = new RestrictiveAnnotationHandler(config);
+      handlerListBuilder.add(restrictiveAnnotationHandler);
     }
     if (config.handleTestAssertionLibraries()) {
       handlerListBuilder.add(new AssertionHandler(methodNameUtil));
     }
-    handlerListBuilder.add(new LibraryModelsHandler(config));
+    handlerListBuilder.add(new GuavaAssertionsHandler());
+    LibraryModelsHandler libraryModelsHandler = new LibraryModelsHandler(config);
+    handlerListBuilder.add(libraryModelsHandler);
     handlerListBuilder.add(StreamNullabilityPropagatorFactory.getRxStreamNullabilityPropagator());
-    handlerListBuilder.add(StreamNullabilityPropagatorFactory.getJavaStreamNullabilityPropagator());
+    handlerListBuilder.add(
+        StreamNullabilityPropagatorFactory.getReactorStreamNullabilityPropagator());
+    StreamNullabilityPropagator javaStreamNullabilityPropagator =
+        StreamNullabilityPropagatorFactory.getJavaStreamNullabilityPropagator();
+    handlerListBuilder.add(javaStreamNullabilityPropagator);
+    handlerListBuilder.add(
+        StreamNullabilityPropagatorFactory.fromSpecs(
+            libraryModelsHandler.getStreamNullabilitySpecs()));
     handlerListBuilder.add(new ContractHandler(config));
     handlerListBuilder.add(new ApacheThriftIsSetHandler());
     handlerListBuilder.add(new GrpcHandler());
     handlerListBuilder.add(new RequiresNonNullHandler());
     handlerListBuilder.add(new EnsuresNonNullHandler());
+    handlerListBuilder.add(new EnsuresNonNullIfHandler());
+    handlerListBuilder.add(new SynchronousCallbackHandler());
+    if (config.serializationIsActive() && config.getSerializationConfig().fieldInitInfoEnabled) {
+      handlerListBuilder.add(
+          new FieldInitializationSerializationHandler(config.getSerializationConfig()));
+    }
     if (config.checkOptionalEmptiness()) {
       handlerListBuilder.add(new OptionalEmptinessHandler(config, methodNameUtil));
     }
-    if (config.checkContracts()) {
-      handlerListBuilder.add(new ContractCheckHandler(config));
+    handlerListBuilder.add(new ContractCheckHandler(config));
+    handlerListBuilder.add(new LombokHandler(config));
+    // JSpecify mode gets the lambda return nullability from generic method inference instead.
+    if (!config.isJSpecifyMode()) {
+      handlerListBuilder.add(new FluentFutureHandler(config));
     }
+    handlerListBuilder.add(new JakartaPersistenceHandler());
+    handlerListBuilder.add(new SpringHandler());
+    CompositeHandler mainHandler = new CompositeHandler(handlerListBuilder.build());
 
-    return new CompositeHandler(handlerListBuilder.build());
+    // Initialize the handlers that need to be aware of the main handler
+    if (restrictiveAnnotationHandler != null) {
+      restrictiveAnnotationHandler.initMainHandler(mainHandler);
+    }
+    libraryModelsHandler.initMainHandler(mainHandler);
+    javaStreamNullabilityPropagator.initMainHandler(mainHandler);
+
+    return mainHandler;
   }
 
   /**

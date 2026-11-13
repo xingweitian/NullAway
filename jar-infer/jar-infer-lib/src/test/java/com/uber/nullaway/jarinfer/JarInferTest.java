@@ -27,15 +27,21 @@ import com.google.errorprone.bugpatterns.BugChecker;
 import com.sun.tools.javac.main.Main;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
-import java.nio.file.Files;
-import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
+import java.security.KeyStore;
+import java.security.KeyStoreException;
 import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.UnrecoverableEntryException;
+import java.security.cert.CertificateException;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.zip.ZipFile;
+import jdk.security.jarsigner.JarSigner;
 import org.apache.commons.io.FilenameUtils;
 import org.junit.Assert;
 import org.junit.Before;
@@ -47,7 +53,6 @@ import org.junit.runners.JUnit4;
 
 /** Unit tests for {@link com.uber.nullaway.jarinfer}. */
 @RunWith(JUnit4.class)
-@SuppressWarnings("CheckTestExtendsBaseClass")
 public class JarInferTest {
 
   @Rule public TemporaryFolder temporaryFolder = new TemporaryFolder();
@@ -55,14 +60,11 @@ public class JarInferTest {
 
   private CompilationTestHelper compilationTestHelper;
 
-  @BugPattern(
-      name = "DummyChecker",
-      summary = "Dummy checker to use CompilationTestHelper",
-      severity = WARNING)
   /**
    * A dummy checker to allow us to use {@link CompilationTestHelper} to compile Java code for
    * testing, as it requires a {@link BugChecker} to run.
    */
+  @BugPattern(summary = "Dummy checker to use CompilationTestHelper", severity = WARNING)
   public static class DummyChecker extends BugChecker {
     public DummyChecker() {}
   }
@@ -167,17 +169,25 @@ public class JarInferTest {
    * @param result Map of 'method signatures' to their 'inferred list of NonNull parameters'.
    * @param expected Map of 'method signatures' to their 'expected list of NonNull parameters'.
    */
-  private boolean verify(Map<String, Set<Integer>> result, HashMap<String, Set<Integer>> expected) {
+  private boolean verify(Map<String, Set<Integer>> result, Map<String, Set<Integer>> expected) {
     for (Map.Entry<String, Set<Integer>> entry : result.entrySet()) {
       String mtd_sign = entry.getKey();
       Set<Integer> ddParams = entry.getValue();
-      if (ddParams.isEmpty()) continue;
-      Set<Integer> xddParams = expected.get(mtd_sign);
-      if (xddParams == null) return false;
-      for (Integer var : ddParams) {
-        if (!xddParams.remove(var)) return false;
+      if (ddParams.isEmpty()) {
+        continue;
       }
-      if (!xddParams.isEmpty()) return false;
+      Set<Integer> xddParams = expected.get(mtd_sign);
+      if (xddParams == null) {
+        return false;
+      }
+      for (Integer var : ddParams) {
+        if (!xddParams.remove(var)) {
+          return false;
+        }
+      }
+      if (!xddParams.isEmpty()) {
+        return false;
+      }
       expected.remove(mtd_sign);
     }
     return expected.isEmpty();
@@ -195,8 +205,8 @@ public class JarInferTest {
         "toys",
         "Test",
         ImmutableMap.of(
-            "toys.Test:void test(String, Foo, Bar)", Sets.newHashSet(0, 2),
-            "toys.Foo:boolean run(String)", Sets.newHashSet(1)),
+            "toys.Test:void test(java.lang.String, toys.Foo, toys.Bar)", Sets.newHashSet(0, 2),
+            "toys.Foo:boolean run(java.lang.String)", Sets.newHashSet(0)),
         "class Foo {",
         "  private String foo;",
         "  public Foo(String str) {",
@@ -256,7 +266,8 @@ public class JarInferTest {
         "toyNonStatic",
         "toys",
         "Foo",
-        ImmutableMap.of("toys.Foo:void test(String, String)", Sets.newHashSet(1)),
+        ImmutableMap.of(
+            "toys.Foo:void test(java.lang.String, java.lang.String)", Sets.newHashSet(0)),
         "class Foo {",
         "  private String foo;",
         "  public Foo(String str) {",
@@ -292,7 +303,9 @@ public class JarInferTest {
         "toyNullTestAPI",
         "toys",
         "Foo",
-        ImmutableMap.of("toys.Foo:void test(String, String, String)", Sets.newHashSet(1, 3)),
+        ImmutableMap.of(
+            "toys.Foo:void test(java.lang.String, java.lang.String, java.lang.String)",
+            Sets.newHashSet(0, 2)),
         "import com.google.common.base.Preconditions;",
         "import java.util.Objects;",
         "import org.junit.Assert;",
@@ -321,7 +334,9 @@ public class JarInferTest {
         "toyNullTestAPI",
         "toys",
         "Foo",
-        ImmutableMap.of("toys.Foo:void test(String, String, String)", Sets.newHashSet(1, 2)),
+        ImmutableMap.of(
+            "toys.Foo:void test(java.lang.String, java.lang.String, java.lang.String)",
+            Sets.newHashSet(0, 1)),
         "import com.google.common.base.Preconditions;",
         "import java.util.Objects;",
         "import org.junit.Assert;",
@@ -351,7 +366,8 @@ public class JarInferTest {
         "toys",
         "Foo",
         ImmutableMap.of(
-            "toys.Foo:void test(Object, Object, Object, Object)", Sets.newHashSet(1, 4)),
+            "toys.Foo:void test(java.lang.Object, java.lang.Object, java.lang.Object, java.lang.Object)",
+            Sets.newHashSet(0, 3)),
         "import com.google.common.base.Preconditions;",
         "import java.util.Objects;",
         "import org.junit.Assert;",
@@ -390,7 +406,8 @@ public class JarInferTest {
         "toyNullTestAPI",
         "toys",
         "Foo",
-        ImmutableMap.of("toys.Foo:void test(String, String)", Sets.newHashSet(1)),
+        ImmutableMap.of(
+            "toys.Foo:void test(java.lang.String, java.lang.String)", Sets.newHashSet(0)),
         "import com.google.common.base.Preconditions;",
         "import java.util.Objects;",
         "import org.junit.Assert;",
@@ -406,6 +423,206 @@ public class JarInferTest {
         "      t = s;",
         "    }",
         "    Objects.requireNonNull(t);",
+        "  }",
+        "}");
+  }
+
+  @Test
+  public void testObjectArray() throws Exception {
+    testTemplate(
+        "testObjectArray",
+        "arrays",
+        "TestArray",
+        ImmutableMap.of(
+            "arrays.TestArray:java.lang.String foo(java.lang.Object[])", Sets.newHashSet(0)),
+        "class TestArray {",
+        "  public static String foo(Object[] o) {",
+        "    return o.toString();",
+        "  }",
+        "}");
+  }
+
+  @Test
+  public void testGenericMethod() throws Exception {
+    testTemplate(
+        "testGenericMethod",
+        "generic",
+        "TestGeneric",
+        ImmutableMap.of("generic.TestGeneric:java.lang.String foo(T)", Sets.newHashSet(0)),
+        "public class TestGeneric<T> {",
+        "  public String foo(T t) {",
+        "    return t.toString();",
+        "  }",
+        "  public static void main(String arg[]) {",
+        "    TestGeneric<String> tg = new TestGeneric<String>();",
+        "    System.out.println(tg.foo(\"generic test\"));",
+        "  }",
+        "}");
+  }
+
+  @Test
+  public void testMethodWithGenericParameter() throws Exception {
+    testTemplate(
+        "testMethodWithGenericParameter",
+        "generic",
+        "TestGeneric",
+        ImmutableMap.of(
+            "generic.TestGeneric:java.lang.String getString(generic.TestGeneric.Generic<java.lang.String,java.lang.String>)",
+            Sets.newHashSet(0)),
+        "public class TestGeneric {",
+        "  static class Generic<T,U> {",
+        "    public String foo(T t) {",
+        "      return \"hi\";",
+        "    }",
+        "  }",
+        "  public String getString(Generic<String,String> g) {",
+        "    return g.foo(\"test\");",
+        "  }",
+        "}");
+  }
+
+  @Test
+  public void nestedGeneric() throws Exception {
+    testTemplate(
+        "nestedGeneric",
+        "generic",
+        "TestGeneric",
+        ImmutableMap.of(
+            "generic.TestGeneric:java.lang.String getString(generic.TestGeneric.Generic<generic.TestGeneric.Generic<java.lang.String>>)",
+            Sets.newHashSet(0)),
+        "public class TestGeneric {",
+        "  static class Generic<T> {",
+        "    public String foo(T t) {",
+        "      return \"hi\";",
+        "    }",
+        "  }",
+        "  public String getString(Generic<Generic<String>> g) {",
+        "    return g.foo(null);",
+        "  }",
+        "}");
+  }
+
+  @Test
+  public void wildcards() throws Exception {
+    testTemplate(
+        "wildcards",
+        "generic",
+        "TestGeneric",
+        ImmutableMap.of(
+            "generic.TestGeneric:void genericWildcardLower(generic.TestGeneric.Generic<? super java.lang.String>)",
+            Sets.newHashSet(0),
+            "generic.TestGeneric:void genericWildcard(generic.TestGeneric.Generic<?>)",
+            Sets.newHashSet(0),
+            "generic.TestGeneric:java.lang.String genericWildcardUpper(generic.TestGeneric.Generic<? extends java.lang.String>)",
+            Sets.newHashSet(0)),
+        "public class TestGeneric {",
+        "  public abstract static class Generic<T> {",
+        "    public String getString(T t) {",
+        "      return \"t\";",
+        "    }",
+        "    public void doNothing() {}",
+        "    public abstract T getSomething();",
+        "  }",
+        "  public static void genericWildcard(Generic<?> g) { g.doNothing(); };",
+        "  public static String genericWildcardUpper(Generic<? extends String> g) { return g.getSomething(); };",
+        "  public static void genericWildcardLower(Generic<? super String> g) { g.getString(\"hello\"); };",
+        "}");
+  }
+
+  @Test
+  public void wildcardReturnTypes() throws Exception {
+    testTemplate(
+        "wildcardReturnTypes",
+        "generic",
+        "TestGeneric",
+        ImmutableMap.of(
+            "generic.TestGeneric:generic.TestGeneric.Generic<?> retUnbounded(java.lang.Object)",
+            Sets.newHashSet(0),
+            "generic.TestGeneric:generic.TestGeneric.Generic<? extends java.lang.String> retUpper(java.lang.Object)",
+            Sets.newHashSet(0),
+            "generic.TestGeneric:generic.TestGeneric.Generic<? super java.lang.String> retLower(java.lang.Object)",
+            Sets.newHashSet(0),
+            "generic.TestGeneric:generic.TestGeneric.Generic<? extends generic.TestGeneric.Generic<? super java.lang.String>> retNested(java.lang.Object)",
+            Sets.newHashSet(0)),
+        "public class TestGeneric {",
+        "  public abstract static class Generic<T> {}",
+        "  public static Generic<?> retUnbounded(Object o) { o.toString(); return null; };",
+        "  public static Generic<? extends String> retUpper(Object o) { o.toString(); return null; };",
+        "  public static Generic<? super String> retLower(Object o) { o.toString(); return null; };",
+        "  public static Generic<? extends Generic<? super String>> retNested(Object o) { o.toString(); return null; };",
+        "}");
+  }
+
+  @Test
+  public void multiArgWildcards() throws Exception {
+    testTemplate(
+        "multiArgWildcards",
+        "generic",
+        "TestGeneric",
+        ImmutableMap.of(
+            "generic.TestGeneric:void genericMultiWildcard(java.lang.String, generic.TestGeneric.Generic<?,?>)",
+            Sets.newHashSet(1)),
+        "public class TestGeneric {",
+        "  public abstract static class Generic<T,U> {",
+        "    public void doNothing() {}",
+        "  }",
+        "  public static void genericMultiWildcard(String s, Generic<?,?> g) { g.doNothing(); };",
+        "}");
+  }
+
+  @Test
+  public void nestedWildcard() throws Exception {
+    testTemplate(
+        "nestedWildcard",
+        "generic",
+        "TestGeneric",
+        ImmutableMap.of(
+            "generic.TestGeneric:void nestedWildcard(generic.TestGeneric.Generic<generic.TestGeneric.Generic<?>>)",
+            Sets.newHashSet(0)),
+        "public class TestGeneric {",
+        "  public abstract static class Generic<T> {",
+        "    public void doNothing() {}",
+        "  }",
+        "  public static void nestedWildcard(Generic<Generic<?>> g) { g.doNothing(); };",
+        "}");
+  }
+
+  @Test
+  public void constructors() throws Exception {
+    testTemplate(
+        "constructors",
+        "toys",
+        "TestConstructor",
+        ImmutableMap.of(
+            "toys.TestConstructor:void TestConstructor(java.lang.String)", Sets.newHashSet(0)),
+        "public class TestConstructor {",
+        "  TestConstructor(String s) {",
+        "    s.toString();",
+        "  }",
+        "}");
+  }
+
+  @Test
+  public void syntheticMethodsAreSkipped() throws Exception {
+    compilationTestHelper =
+        CompilationTestHelper.newInstance(DummyChecker.class, getClass())
+            .setArgs(
+                Arrays.asList("-d", temporaryFolder.getRoot().getAbsolutePath(), "--release", "8"));
+    testTemplate(
+        "syntheticMethodsAreSkipped",
+        "syntheticmethods",
+        "Test",
+        ImmutableMap.of(
+            "syntheticmethods.Test:int dereference(syntheticmethods.Test)", Sets.newHashSet(0)),
+        "public class Test {",
+        "  private String value;",
+        "  public static int dereference(Test test) {",
+        "    return test.value.length();",
+        "  }",
+        "  public static class Nested {",
+        "    public static String getValue(Test test) {",
+        "      return test.value;",
+        "    }",
         "  }",
         "}");
   }
@@ -453,24 +670,14 @@ public class JarInferTest {
   @Test
   public void testSignedJars() throws Exception {
     // Set test configuration paths / options
-    final String baseJarPath = "../test-java-lib-jarinfer/build/libs/test-java-lib-jarinfer.jar";
-    final String pkg = "com.uber.nullaway.jarinfer.toys.unannotated";
-    final String baseJarName = FilenameUtils.getBaseName(baseJarPath);
-    final String workingFolderPath = outputFolder.newFolder("signed_" + pkg).getAbsolutePath();
-    final String inputJarPath = workingFolderPath + "/" + baseJarName + ".jar";
-    final String outputJarPath = workingFolderPath + "/" + baseJarName + "-annotated.jar";
+    String baseJarPath = "../test-java-lib-jarinfer/build/libs/test-java-lib-jarinfer.jar";
+    String pkg = "com.uber.nullaway.jarinfer.toys.unannotated";
+    String baseJarName = FilenameUtils.getBaseName(baseJarPath);
+    String workingFolderPath = outputFolder.newFolder("signed_" + pkg).getAbsolutePath();
+    String inputJarPath = workingFolderPath + "/" + baseJarName + ".jar";
+    String outputJarPath = workingFolderPath + "/" + baseJarName + "-annotated.jar";
 
-    // Copy Jar to workspace, and sign it
-    Files.copy(
-        Paths.get(baseJarPath), Paths.get(inputJarPath), StandardCopyOption.REPLACE_EXISTING);
-    String ksPath =
-        Thread.currentThread().getContextClassLoader().getResource("testKeyStore.jks").getPath();
-    // JDK 8 only?
-    sun.security.tools.jarsigner.Main jarSignerTool = new sun.security.tools.jarsigner.Main();
-    jarSignerTool.run(
-        new String[] {
-          "-keystore", ksPath, "-storepass", "testPassword", inputJarPath, "testKeystore"
-        });
+    copyAndSignJar(baseJarPath, inputJarPath);
 
     // Test that this new jar fails if not run in --strip-jar-signatures mode
     boolean signedJarExceptionThrown = false;
@@ -505,6 +712,27 @@ public class JarInferTest {
     Assert.assertTrue(
         "Annotated jar after signature stripping does not preserve the info inside META-INF/MANIFEST.MF",
         EntriesComparator.compareManifestContents(outputJarPath, baseJarPath));
+  }
+
+  /** copy the jar at {@code baseJarPath} to a signed jar at {@code signedJarPath} */
+  private void copyAndSignJar(String baseJarPath, String signedJarPath)
+      throws CertificateException,
+          KeyStoreException,
+          IOException,
+          NoSuchAlgorithmException,
+          UnrecoverableEntryException {
+    String ksPath =
+        Thread.currentThread().getContextClassLoader().getResource("testKeyStore.jks").getPath();
+    var ksPassword = "testPassword".toCharArray();
+    var keystore = KeyStore.getInstance(new File(ksPath), ksPassword);
+    var protParam = new KeyStore.PasswordProtection(ksPassword);
+    var pkEntry = (KeyStore.PrivateKeyEntry) keystore.getEntry("testKeystore", protParam);
+
+    JarSigner signer = new JarSigner.Builder(pkEntry).digestAlgorithm("SHA-256").build();
+    try (ZipFile in = new ZipFile(baseJarPath);
+        FileOutputStream out = new FileOutputStream(signedJarPath)) {
+      signer.sign(in, out);
+    }
   }
 
   private byte[] sha1sum(String path) throws Exception {

@@ -18,28 +18,39 @@
 
 package com.uber.nullaway.dataflow;
 
+import static com.uber.nullaway.NullabilityUtil.castToNonNull;
+
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.errorprone.VisitorState;
+import com.google.errorprone.annotations.DoNotCall;
+import com.google.errorprone.dataflow.nullnesspropagation.NullnessAnalysis;
+import com.sun.source.tree.BlockTree;
+import com.sun.source.tree.LambdaExpressionTree;
+import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.Tree;
+import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePath;
 import com.sun.tools.javac.util.Context;
 import com.uber.nullaway.Config;
+import com.uber.nullaway.NullAway;
+import com.uber.nullaway.NullabilityUtil;
 import com.uber.nullaway.Nullness;
 import com.uber.nullaway.handlers.Handler;
 import com.uber.nullaway.handlers.contract.ContractNullnessStoreInitializer;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.function.Predicate;
-import javax.annotation.Nullable;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.Modifier;
 import javax.lang.model.element.VariableElement;
 import org.checkerframework.nullaway.dataflow.analysis.AnalysisResult;
 import org.checkerframework.nullaway.dataflow.cfg.node.MethodAccessNode;
-import org.checkerframework.nullaway.dataflow.cfg.node.MethodInvocationNode;
 import org.checkerframework.nullaway.dataflow.cfg.node.Node;
+import org.jspecify.annotations.Nullable;
 
 /**
  * API to our nullness dataflow analysis for access paths.
@@ -48,23 +59,31 @@ import org.checkerframework.nullaway.dataflow.cfg.node.Node;
  */
 public final class AccessPathNullnessAnalysis {
 
-  private static final Context.Key<AccessPathNullnessAnalysis> FIELD_NULLNESS_ANALYSIS_KEY =
-      new Context.Key<>();
-
   private final AccessPath.AccessPathContext apContext;
 
   private final AccessPathNullnessPropagation nullnessPropagation;
 
   private final DataFlow dataFlow;
 
-  @Nullable private AccessPathNullnessPropagation contractNullnessPropagation;
+  private @Nullable AccessPathNullnessPropagation contractNullnessPropagation;
 
-  // Use #instance to instantiate
-  private AccessPathNullnessAnalysis(
-      Predicate<MethodInvocationNode> methodReturnsNonNull,
-      Context context,
-      Config config,
-      Handler handler) {
+  /**
+   * Creates an analysis instance. {@link NullAway} holds the single instance for a compilation and
+   * exposes it via {@link NullAway#getNullnessAnalysis(VisitorState)}; other code should go through
+   * that method rather than constructing an instance directly (hence the {@code @DoNotCall}
+   * annotation).
+   *
+   * @param state visitor state for the compilation
+   * @param analysis instance of NullAway analysis
+   */
+  @DoNotCall
+  public static AccessPathNullnessAnalysis create(VisitorState state, NullAway analysis) {
+    return new AccessPathNullnessAnalysis(state, analysis);
+  }
+
+  private AccessPathNullnessAnalysis(VisitorState state, NullAway analysis) {
+    Config config = analysis.getConfig();
+    Handler handler = analysis.getHandler();
     apContext =
         AccessPath.AccessPathContext.builder()
             .setImmutableTypes(handler.onRegisterImmutableTypes())
@@ -72,47 +91,27 @@ public final class AccessPathNullnessAnalysis {
     this.nullnessPropagation =
         new AccessPathNullnessPropagation(
             Nullness.NONNULL,
-            methodReturnsNonNull,
-            context,
+            state,
             apContext,
-            config,
+            analysis,
+            new CoreNullnessStoreInitializer(analysis.getGenericsChecks()),
+            /* trackUnreachableStores= */ false);
+    this.dataFlow =
+        new DataFlow(
+            config.assertsEnabled(),
             handler,
-            new CoreNullnessStoreInitializer());
-    this.dataFlow = new DataFlow(config.assertsEnabled());
+            config.isJSpecifyMode() ? analysis.getGenericsChecks() : null);
 
     if (config.checkContracts()) {
       this.contractNullnessPropagation =
           new AccessPathNullnessPropagation(
               Nullness.NONNULL,
-              methodReturnsNonNull,
-              context,
+              state,
               apContext,
-              config,
-              handler,
-              new ContractNullnessStoreInitializer());
+              analysis,
+              new ContractNullnessStoreInitializer(),
+              /* trackUnreachableStores= */ true);
     }
-  }
-
-  /**
-   * Get the per-Javac instance of the analysis.
-   *
-   * @param context Javac context
-   * @param methodReturnsNonNull predicate determining whether a method is assumed to return NonNull
-   *     value
-   * @param config analysis config
-   * @return instance of the analysis
-   */
-  public static AccessPathNullnessAnalysis instance(
-      Context context,
-      Predicate<MethodInvocationNode> methodReturnsNonNull,
-      Config config,
-      Handler handler) {
-    AccessPathNullnessAnalysis instance = context.get(FIELD_NULLNESS_ANALYSIS_KEY);
-    if (instance == null) {
-      instance = new AccessPathNullnessAnalysis(methodReturnsNonNull, context, config, handler);
-      context.put(FIELD_NULLNESS_ANALYSIS_KEY, instance);
-    }
-    return instance;
   }
 
   /**
@@ -122,9 +121,20 @@ public final class AccessPathNullnessAnalysis {
    * @param context Javac context
    * @return nullness info for expression, from dataflow
    */
-  @Nullable
-  public Nullness getNullness(TreePath exprPath, Context context) {
-    return dataFlow.expressionDataflow(exprPath, context, nullnessPropagation);
+  public @Nullable Nullness getNullness(TreePath exprPath, Context context) {
+    return dataFlow.expressionDataflow(exprPath, context, nullnessPropagation, false);
+  }
+
+  /**
+   * Get the nullness info for an expression from the current running dataflow analysis (so it may
+   * not be the final result).
+   *
+   * @param exprPath tree path of expression
+   * @param context Javac context
+   * @return nullness info for expression, from running dataflow
+   */
+  public @Nullable Nullness getNullnessFromRunning(TreePath exprPath, Context context) {
+    return dataFlow.expressionDataflow(exprPath, context, nullnessPropagation, true);
   }
 
   /**
@@ -135,9 +145,22 @@ public final class AccessPathNullnessAnalysis {
    * @param context Javac context
    * @return nullness info for expression, from dataflow in case contract check
    */
-  @Nullable
-  public Nullness getNullnessForContractDataflow(TreePath exprPath, Context context) {
-    return dataFlow.expressionDataflow(exprPath, context, contractNullnessPropagation);
+  public @Nullable Nullness getNullnessForContractDataflow(TreePath exprPath, Context context) {
+    return dataFlow.expressionDataflow(
+        exprPath, context, castToNonNull(contractNullnessPropagation), false);
+  }
+
+  /**
+   * Check whether the store before an expression is unreachable in contract dataflow.
+   *
+   * @param exprPath tree path of expression
+   * @param context Javac context
+   * @return true if the store before the expression is unreachable
+   */
+  public boolean isUnreachableForContractDataflow(TreePath exprPath, Context context) {
+    NullnessStore store =
+        dataFlow.resultBeforeExpr(exprPath, context, castToNonNull(contractNullnessPropagation));
+    return store != null && store.isUnreachable();
   }
 
   /**
@@ -148,45 +171,82 @@ public final class AccessPathNullnessAnalysis {
    * @return fields guaranteed to be nonnull at exit of method (or initializer block)
    */
   public Set<Element> getNonnullFieldsOfReceiverAtExit(TreePath path, Context context) {
+    return receiverFieldsAtExit(path, context, NullnessStore::getNonNullReceiverFields);
+  }
+
+  /**
+   * Gets the fields of the receiver that are initialized at exit from a method or initializer
+   * block. Unlike {@link #getNonnullFieldsOfReceiverAtExit}, this includes a field that holds a
+   * value for which {@link Nullness#isNoChange()} holds.
+   *
+   * @param path tree path of method, or initializer block
+   * @param context Javac context
+   * @return fields of the receiver initialized at exit of the method (or initializer block)
+   */
+  public Set<Element> getInitializedFieldsOfReceiverAtExit(TreePath path, Context context) {
+    return receiverFieldsAtExit(path, context, NullnessStore::getInitializedReceiverFields);
+  }
+
+  /**
+   * Applies {@code fields} to the store at exit from a method or initializer block.
+   *
+   * @param path tree path of method, or initializer block
+   * @param context Javac context
+   * @param fields selects receiver fields from a store
+   * @return the selected fields, or an empty set where no store reaches the exit
+   */
+  private Set<Element> receiverFieldsAtExit(
+      TreePath path, Context context, Function<NullnessStore, Set<Element>> fields) {
     NullnessStore nullnessResult = dataFlow.finalResult(path, context, nullnessPropagation);
     if (nullnessResult == null) {
       // this case can occur if the method always throws an exception
       // be conservative and say nothing is initialized
       return Collections.emptySet();
     }
-    return getNonnullReceiverFields(nullnessResult);
-  }
-
-  private Set<Element> getNonnullReceiverFields(NullnessStore nullnessResult) {
-    Set<AccessPath> nonnullAccessPaths = nullnessResult.getAccessPathsWithValue(Nullness.NONNULL);
-    Set<Element> result = new LinkedHashSet<>();
-    for (AccessPath ap : nonnullAccessPaths) {
-      if (ap.getRoot().isReceiver()) {
-        ImmutableList<AccessPathElement> elements = ap.getElements();
-        if (elements.size() == 1) {
-          Element elem = elements.get(0).getJavaElement();
-          if (elem.getKind().equals(ElementKind.FIELD)) {
-            result.add(elem);
-          }
-        }
-      }
-    }
-    return result;
+    return fields.apply(nullnessResult);
   }
 
   /**
-   * Get the instance fields that are guaranteed to be nonnull before the current expression.
+   * Gets the fields of the receiver that are initialized before the current expression: those that
+   * hold a non-null value or a value for which {@link Nullness#isNoChange()} holds.
+   *
+   * @param path tree path of some expression
+   * @param context Javac context
+   * @return fields of the receiver initialized before the expression is evaluated
+   */
+  public Set<Element> getInitializedFieldsOfReceiverBefore(TreePath path, Context context) {
+    return receiverFieldsBefore(path, context, NullnessStore::getInitializedReceiverFields);
+  }
+
+  /**
+   * Gets the fields of the receiver that hold a non-null value before the current expression. For
+   * an initialization check, use {@link #getInitializedFieldsOfReceiverBefore}, which also counts a
+   * field that holds a value for which {@link Nullness#isNoChange()} holds.
    *
    * @param path tree path of some expression
    * @param context Javac context
    * @return fields of receiver guaranteed to be nonnull before expression is evaluated
    */
   public Set<Element> getNonnullFieldsOfReceiverBefore(TreePath path, Context context) {
+    return receiverFieldsBefore( // diff-coverage: ignore -- kept for callers outside NullAway
+        path, context, NullnessStore::getNonNullReceiverFields);
+  }
+
+  /**
+   * Applies {@code fields} to the store before the current expression.
+   *
+   * @param path tree path of some expression
+   * @param context Javac context
+   * @param fields selects receiver fields from a store
+   * @return the selected fields, or an empty set where no store reaches the expression
+   */
+  private Set<Element> receiverFieldsBefore(
+      TreePath path, Context context, Function<NullnessStore, Set<Element>> fields) {
     NullnessStore store = dataFlow.resultBeforeExpr(path, context, nullnessPropagation);
     if (store == null) {
       return Collections.emptySet();
     }
-    return getNonnullReceiverFields(store);
+    return fields.apply(store);
   }
 
   /**
@@ -205,31 +265,98 @@ public final class AccessPathNullnessAnalysis {
   }
 
   /**
-   * Get nullness info for local variables before some node
+   * Get nullness info for local variables (and final fields) before some node represented a nested
+   * method (lambda or anonymous class)
    *
-   * @param path tree path to some AST node within a method / lambda / initializer
+   * @param pathToNestedMethodNode tree path to some AST node representing a nested method
    * @param state visitor state
-   * @return nullness info for local variables just before the node
+   * @param handler handler instance
+   * @return nullness info for local variables just before the leaf of the tree path
    */
-  public NullnessStore getNullnessInfoBeforeNewContext(
-      TreePath path, VisitorState state, Handler handler) {
-    NullnessStore store = dataFlow.resultBefore(path, state.context, nullnessPropagation);
+  public NullnessStore getNullnessInfoBeforeNestedMethodNode(
+      TreePath pathToNestedMethodNode, VisitorState state, Handler handler) {
+    NullnessStore store =
+        dataFlow.resultBefore(pathToNestedMethodNode, state.context, nullnessPropagation);
+    return getAccessPathsForNestedMethod(pathToNestedMethodNode, state, handler, store);
+  }
+
+  /**
+   * Like {@link #getNullnessInfoBeforeNestedMethodNode(TreePath, VisitorState, Handler)}, but works
+   * for a dataflow analysis that is currently running
+   *
+   * @param pathToNestedMethodNode tree path to some AST node representing a nested method
+   * @param state visitor state
+   * @param handler handler instance
+   * @return nullness info for local variables just before the leaf of the tree path
+   */
+  public NullnessStore getNullnessInfoBeforeNestedMethodWithAnalysisRunning(
+      TreePath pathToNestedMethodNode, VisitorState state, Handler handler) {
+    NullnessStore store =
+        dataFlow.resultBeforeWithAnalysisRunning(
+            pathToNestedMethodNode, state.context, nullnessPropagation);
+    return getAccessPathsForNestedMethod(pathToNestedMethodNode, state, handler, store);
+  }
+
+  /**
+   * Get access paths for local variables and final (or {@code @MonotonicNonNull}) fields in the
+   * store before some nested method node.
+   *
+   * @param pathToNestedMethodNode tree path to some AST node representing a nested method
+   * @param state visitor state
+   * @param handler handler instance
+   * @param store nullness store before the nested method node
+   * @return filtered nullness store
+   */
+  private static NullnessStore getAccessPathsForNestedMethod(
+      TreePath pathToNestedMethodNode,
+      VisitorState state,
+      Handler handler,
+      @Nullable NullnessStore store) {
     if (store == null) {
       return NullnessStore.empty();
     }
+    Predicate<AccessPath> handlerPredicate =
+        handler.getAccessPathPredicateForNestedMethod(pathToNestedMethodNode, state);
     return store.filterAccessPaths(
         (ap) -> {
-          if (ap.getElements().size() == 0) {
-            AccessPath.Root root = ap.getRoot();
-            if (!root.isReceiver()) {
-              Element e = root.getVarElement();
-              return e.getKind().equals(ElementKind.PARAMETER)
-                  || e.getKind().equals(ElementKind.LOCAL_VARIABLE);
+          boolean allAPNonRootElementsAreFinalFields = true;
+          ImmutableList<AccessPathElement> elements = ap.getElements();
+          for (int i = 0; i < elements.size(); i++) {
+            AccessPathElement ape = elements.get(i);
+            Element e = ape.getJavaElement();
+            if (i != elements.size() - 1) { // "inner" elements of the access path
+              if (!e.getKind().equals(ElementKind.FIELD)
+                  || !e.getModifiers().contains(Modifier.FINAL)) {
+                allAPNonRootElementsAreFinalFields = false;
+                break;
+              }
+            } else { // last element
+              // must be a field that is final or annotated with @MonotonicNonNull
+              if (!e.getKind().equals(ElementKind.FIELD)
+                  || !(e.getModifiers().contains(Modifier.FINAL)
+                      || hasMonotonicNonNullAnnotation(e))) {
+                allAPNonRootElementsAreFinalFields = false;
+              }
             }
           }
+          if (allAPNonRootElementsAreFinalFields) {
+            Element e = ap.getRoot();
+            return e == null // This is the case for: this(.f)* where each f is a final field.
+                || e.getKind().equals(ElementKind.PARAMETER)
+                || e.getKind().equals(ElementKind.LOCAL_VARIABLE)
+                // rooted at a static field that is either final or annotated with @MonotonicNonNull
+                || (e.getKind().equals(ElementKind.FIELD)
+                    && (e.getModifiers().contains(Modifier.FINAL)
+                        || hasMonotonicNonNullAnnotation(e)));
+          }
 
-          return handler.includeApInfoInSavedContext(ap, state);
+          return handlerPredicate.test(ap);
         });
+  }
+
+  private static boolean hasMonotonicNonNullAnnotation(Element e) {
+    return e.getAnnotationMirrors().stream()
+        .anyMatch(am -> Nullness.isMonotonicNonNullAnnotation(am.getAnnotationType().toString()));
   }
 
   /**
@@ -274,7 +401,7 @@ public final class AccessPathNullnessAnalysis {
       Nullness nullness = store.getNullnessOfAccessPath(accessPath);
       // field is non-null if at least one access path referring to it exists with non-null
       // nullness.
-      if (!nullness.equals(Nullness.NULLABLE)) {
+      if (!NullabilityUtil.nullnessToBool(nullness)) {
         return nullness;
       }
     }
@@ -302,10 +429,9 @@ public final class AccessPathNullnessAnalysis {
     Set<AccessPath> nonnullAccessPaths = nullnessResult.getAccessPathsWithValue(Nullness.NONNULL);
     Set<Element> result = new LinkedHashSet<>();
     for (AccessPath ap : nonnullAccessPaths) {
-      assert !ap.getRoot().isReceiver();
-      Element varElement = ap.getRoot().getVarElement();
-      if (varElement.getKind().equals(ElementKind.FIELD)) {
-        result.add(varElement);
+      Element element = ap.getRoot();
+      if (element != null && element.getKind().equals(ElementKind.FIELD)) {
+        result.add(element);
       }
     }
     return result;
@@ -324,7 +450,7 @@ public final class AccessPathNullnessAnalysis {
    * @param context Javac context
    * @return the final NullnessStore on exit from the method.
    */
-  public NullnessStore forceRunOnMethod(TreePath methodPath, Context context) {
+  public @Nullable NullnessStore forceRunOnMethod(TreePath methodPath, Context context) {
     return dataFlow.finalResult(methodPath, context, nullnessPropagation);
   }
 
@@ -342,9 +468,10 @@ public final class AccessPathNullnessAnalysis {
 
     // We use the CFG to get the Node corresponding to the expression
     Set<Node> exprNodes =
-        dataFlow
-            .getControlFlowGraph(exprPath, context, nullnessPropagation)
-            .getNodesCorrespondingToTree(exprPath.getLeaf());
+        castToNonNull(
+            dataFlow
+                .getControlFlowGraph(exprPath, context, nullnessPropagation)
+                .getNodesCorrespondingToTree(exprPath.getLeaf()));
 
     if (exprNodes.size() != 1) {
       // Since the expression must have a single corresponding node
@@ -356,9 +483,7 @@ public final class AccessPathNullnessAnalysis {
         AccessPath.fromBaseAndElement(exprNodes.iterator().next(), variableElement, apContext);
 
     if (store != null && ap != null) {
-      if (store
-          .getAccessPathsWithValue(Nullness.NONNULL)
-          .stream()
+      if (store.getAccessPathsWithValue(Nullness.NONNULL).stream()
           .anyMatch(accessPath -> accessPath.equals(ap))) {
         return Nullness.NONNULL;
       }
@@ -369,5 +494,40 @@ public final class AccessPathNullnessAnalysis {
   /** invalidate all caches */
   public void invalidateCaches() {
     dataFlow.invalidateCaches();
+  }
+
+  /**
+   * Check if dataflow analysis is currently running for the method / lambda / initializer at the
+   * given TreePath.
+   *
+   * @param path tree path to check
+   * @param context Javac context
+   * @return true if dataflow analysis is currently running for the given path
+   */
+  public boolean isRunning(TreePath path, Context context) {
+    Tree leaf = path.getLeaf();
+    Preconditions.checkArgument(
+        leaf instanceof MethodTree
+            || leaf instanceof LambdaExpressionTree
+            || leaf instanceof BlockTree
+            || leaf instanceof VariableTree,
+        "Leaf of methodPath must be of type MethodTree, LambdaExpressionTree, BlockTree, or VariableTree, but was %s",
+        leaf.getClass().getName());
+    return dataFlow.isRunning(path, context, nullnessPropagation);
+  }
+
+  /**
+   * Updates any stored {@link VisitorState} objects to account for the fact that we are checking a
+   * new compilation unit. Required since {@link VisitorState} objects internally contain a {@link
+   * com.google.errorprone.DescriptionListener} tied to a compilation unit that cannot be updated
+   * via public APIs.
+   *
+   * @param state the new visitor state
+   */
+  public void updateForNewCompilationUnit(VisitorState state) {
+    nullnessPropagation.updateForNewCompilationUnit(state);
+    if (contractNullnessPropagation != null) {
+      contractNullnessPropagation.updateForNewCompilationUnit(state);
+    }
   }
 }

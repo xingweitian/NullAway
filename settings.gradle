@@ -4,29 +4,42 @@ pluginManagement {
         gradlePluginPortal()
         google()
     }
-    resolutionStrategy {
-        eachPlugin {
-            if (requested.id.namespace == "com.android") {
-                useModule("com.android.tools.build:gradle:${requested.version}")
-            }
-        }
-    }
 }
 
+plugins {
+    // to automatically pull in relevant JDK toolchains when not present on the local machine
+    id("org.gradle.toolchains.foojay-resolver-convention") version "1.0.0"
+    // diff coverage after `test` and the pitestDiff task in every Java project; see AGENTS.md
+    id("io.github.cribro-dev.cribro") version "1.1.1"
+}
+
+include ':annotations'
 include ':nullaway'
+include ':nullaway-bom'
 include ':sample-library-model'
 include ':sample'
-include ':sample-app'
 include ':test-java-lib'
 include ':test-java-lib-lombok'
+include ':test-java-module'
 include ':test-library-models'
-include ':compile-bench'
 include ':jar-infer:android-jarinfer-models-sdk28'
 include ':jar-infer:android-jarinfer-models-sdk29'
 include ':jar-infer:android-jarinfer-models-sdk30'
+include ':jar-infer:android-jarinfer-models-sdk31'
 include ':jar-infer:jar-infer-lib'
 include ':jar-infer:jar-infer-cli'
 include ':jar-infer:test-java-lib-jarinfer'
 include ':jar-infer:nullaway-integration-test'
-include ':jar-infer:test-android-lib-jarinfer'
+include ':jdk-javac-plugin'
 include ':jmh'
+include ':guava-recent-unit-tests'
+include ':jdk-recent-unit-tests'
+include ':code-coverage-report'
+include ':sample-app'
+include ':jar-infer:test-android-lib-jarinfer'
+include ':library-model:library-model-generator'
+include ':jdk-annotations:astubx-generator'
+include ':jdk-annotations:astubx-generator-cli'
+include ':jdk-annotations:test-annotated'
+include ':jdk-annotations:test-unannotated'
+include ':jdk-annotations:jdk-integration-test'

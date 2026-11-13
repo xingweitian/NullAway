@@ -24,18 +24,18 @@ package com.uber.nullaway.handlers;
 
 import static com.uber.nullaway.Nullness.NONNULL;
 
+import com.google.errorprone.VisitorState;
 import com.google.errorprone.util.ASTHelpers;
 import com.sun.tools.javac.code.Symbol;
-import com.sun.tools.javac.code.Types;
-import com.sun.tools.javac.util.Context;
 import com.uber.nullaway.dataflow.AccessPath;
 import com.uber.nullaway.dataflow.AccessPathNullnessPropagation;
 import java.util.List;
 import org.checkerframework.nullaway.dataflow.cfg.node.MethodInvocationNode;
 import org.checkerframework.nullaway.dataflow.cfg.node.Node;
+import org.jspecify.annotations.Nullable;
 
 /** This Handler deals with assertions which ensure that their arguments cannot be null. */
-public class AssertionHandler extends BaseNoOpHandler {
+public class AssertionHandler implements Handler {
 
   private final MethodNameUtil methodNameUtil;
 
@@ -46,47 +46,41 @@ public class AssertionHandler extends BaseNoOpHandler {
   @Override
   public NullnessHint onDataflowVisitMethodInvocation(
       MethodInvocationNode node,
-      Types types,
-      Context context,
+      Symbol.MethodSymbol callee,
+      VisitorState state,
       AccessPath.AccessPathContext apContext,
       AccessPathNullnessPropagation.SubNodeValues inputs,
       AccessPathNullnessPropagation.Updates thenUpdates,
       AccessPathNullnessPropagation.Updates elseUpdates,
       AccessPathNullnessPropagation.Updates bothUpdates) {
-    Symbol.MethodSymbol callee = ASTHelpers.getSymbol(node.getTree());
-    if (callee == null) {
-      return NullnessHint.UNKNOWN;
-    }
-
     if (!methodNameUtil.isUtilInitialized()) {
       methodNameUtil.initializeMethodNames(callee.name.table);
     }
 
-    // Look for statements of the form: assertThat(A).isNotNull()
+    // Look for statements of the form: assertThat(A).isNotNull() or
+    // assertThat(A).isInstanceOf(Foo.class)
     // A will not be NULL after this statement.
-    if (methodNameUtil.isMethodIsNotNull(callee)) {
-      Node receiver = node.getTarget().getReceiver();
-      if (receiver instanceof MethodInvocationNode) {
-        MethodInvocationNode receiver_method = (MethodInvocationNode) receiver;
-        Symbol.MethodSymbol receiver_symbol = ASTHelpers.getSymbol(receiver_method.getTree());
-        if (methodNameUtil.isMethodAssertThat(receiver_symbol)) {
-          Node arg = receiver_method.getArgument(0);
-          AccessPath ap = AccessPath.getAccessPathForNodeNoMapGet(arg, apContext);
-          if (ap != null) {
-            bothUpdates.set(ap, NONNULL);
-          }
-        }
+    if (methodNameUtil.isMethodIsNotNull(callee, state)
+        || methodNameUtil.isMethodHasSize(callee, state)
+        || methodNameUtil.isMethodIsInstanceOf(callee, state)) {
+      AccessPath ap = getAccessPathForNotNullAssertThatExpr(node, state, apContext);
+      if (ap != null) {
+        bothUpdates.set(ap, NONNULL);
       }
     }
 
     // Look for statements of the form:
     //    * assertThat(A, is(not(nullValue())))
     //    * assertThat(A, is(notNullValue()))
+    //    * assertThat(A, is(instanceOf(Foo.class)))
+    //    * assertThat(A, isA(Foo.class))
     if (methodNameUtil.isMethodHamcrestAssertThat(callee)
         || methodNameUtil.isMethodJunitAssertThat(callee)) {
       List<Node> args = node.getArguments();
-      if (args.size() == 2 && methodNameUtil.isMatcherIsNotNull(args.get(1))) {
-        AccessPath ap = AccessPath.getAccessPathForNodeNoMapGet(args.get(0), apContext);
+      if (args.size() == 2
+          && (methodNameUtil.isMatcherIsNotNull(args.get(1))
+              || methodNameUtil.isMatcherIsInstanceOf(args.get(1)))) {
+        AccessPath ap = AccessPath.getAccessPathForNode(args.get(0), state, apContext);
         if (ap != null) {
           bothUpdates.set(ap, NONNULL);
         }
@@ -94,5 +88,31 @@ public class AssertionHandler extends BaseNoOpHandler {
     }
 
     return NullnessHint.UNKNOWN;
+  }
+
+  /**
+   * Returns the AccessPath for the argument of an assertThat() call, if present as a valid nested
+   * receiver expression of a method invocation
+   *
+   * @param node the method invocation node
+   * @param state the visitor state
+   * @param apContext the access path context
+   * @return the AccessPath for the argument of the assertThat() call, if present, otherwise {@code
+   *     null}
+   */
+  private @Nullable AccessPath getAccessPathForNotNullAssertThatExpr(
+      MethodInvocationNode node, VisitorState state, AccessPath.AccessPathContext apContext) {
+    Node receiver = node.getTarget().getReceiver();
+    if (receiver instanceof MethodInvocationNode receiver_method) {
+      Symbol.MethodSymbol receiver_symbol = ASTHelpers.getSymbol(receiver_method.getTree());
+      if (methodNameUtil.isMethodAssertThat(receiver_symbol)) {
+        Node arg = receiver_method.getArgument(0);
+        return AccessPath.getAccessPathForNode(arg, state, apContext);
+      } else if (methodNameUtil.isMethodAssertJDescribedAs(receiver_symbol)) {
+        // For calls to as() or describedAs(), we recursively search for the assertThat() call
+        return getAccessPathForNotNullAssertThatExpr(receiver_method, state, apContext);
+      }
+    }
+    return null;
   }
 }

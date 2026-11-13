@@ -1,4 +1,5 @@
 package com.uber.nullaway.handlers;
+
 /*
  * Copyright (c) 2017 Uber Technologies, Inc.
  *
@@ -22,19 +23,23 @@ package com.uber.nullaway.handlers;
  */
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
-import com.google.errorprone.predicates.type.DescendantOf;
+import com.google.errorprone.predicates.TypePredicates;
 import com.google.errorprone.suppliers.Suppliers;
 import com.uber.nullaway.handlers.stream.StreamModelBuilder;
 import com.uber.nullaway.handlers.stream.StreamTypeRecord;
 
 public class StreamNullabilityPropagatorFactory {
+
+  /** Returns a handler for the standard Java 8 stream APIs. */
   public static StreamNullabilityPropagator getJavaStreamNullabilityPropagator() {
     ImmutableList<StreamTypeRecord> streamModels =
         StreamModelBuilder.start()
-            .addStreamType(new DescendantOf(Suppliers.typeFromString("java.util.stream.Stream")))
+            .addStreamType(
+                TypePredicates.isDescendantOf(Suppliers.typeFromString("java.util.stream.Stream")))
             // Names of all the methods of java.util.stream.Stream that behave like .filter(...)
             // (must take exactly 1 argument)
             .withFilterMethodFromSignature("filter(java.util.function.Predicate<? super T>)")
+            .withFilterMethodFromSignature("takeWhile(java.util.function.Predicate<? super T>)")
             // Names and relevant arguments of all the methods of java.util.stream.Stream that
             // behave
             // like .map(...) for the purposes of this checker (the listed arguments are those that
@@ -62,12 +67,36 @@ public class StreamNullabilityPropagatorFactory {
                 "accept",
                 ImmutableSet.of(0))
             .withMapMethodAllFromName("flatMap", "apply", ImmutableSet.of(0))
+            // Names and relevant arguments of all the methods of java.util.stream.Stream that
+            // behave like .collect(...) for the purposes of this checker
+            .withCollectMethodFromSignature(
+                "<R,A>collect(java.util.stream.Collector<? super T,A,R>)",
+                "java.util.stream.Collectors",
+                "<T,K,U>toMap(java.util.function.Function<? super T,? extends K>,java.util.function.Function<? super T,? extends U>)",
+                ImmutableSet.of(0, 1),
+                "apply",
+                ImmutableSet.of(0))
+            .withCollectMethodFromSignature(
+                "<R,A>collect(java.util.stream.Collector<? super T,A,R>)",
+                "java.util.stream.Collectors",
+                "<T,K>groupingBy(java.util.function.Function<? super T,? extends K>)",
+                ImmutableSet.of(0),
+                "apply",
+                ImmutableSet.of(0))
+            .withCollectMethodFromSignature(
+                "<R,A>collect(java.util.stream.Collector<? super T,A,R>)",
+                "com.google.common.collect.ImmutableMap",
+                "<T,K,V>toImmutableMap(java.util.function.Function<? super T,? extends K>,java.util.function.Function<? super T,? extends V>)",
+                ImmutableSet.of(0, 1),
+                "apply",
+                ImmutableSet.of(0))
             // List of methods of java.util.stream.Stream through which we just propagate the
             // nullability information of the last call, e.g. m() in
             // Observable.filter(...).m().map(...) means the
             // nullability information from filter(...) should still be propagated to map(...),
             // ignoring the interleaving call to m().
             .withPassthroughMethodFromSignature("distinct()")
+            .withPassthroughMethodAllFromName("sorted")
             // List of methods of java.util.stream.Stream that both use the nullability information
             // internally (like map does), but also don't change the values flowing through the
             // stream
@@ -77,13 +106,16 @@ public class StreamNullabilityPropagatorFactory {
     return new StreamNullabilityPropagator(streamModels);
   }
 
+  /** Returns a handler for io.reactivex.* stream APIs */
   public static StreamNullabilityPropagator getRxStreamNullabilityPropagator() {
     ImmutableList<StreamTypeRecord> rxModels =
         StreamModelBuilder.start()
-            .addStreamType(new DescendantOf(Suppliers.typeFromString("io.reactivex.Observable")))
+            .addStreamType(
+                TypePredicates.isDescendantOf(Suppliers.typeFromString("io.reactivex.Observable")))
             // Names of all the methods of io.reactivex.Observable that behave like .filter(...)
             // (must take exactly 1 argument)
             .withFilterMethodFromSignature("filter(io.reactivex.functions.Predicate<? super T>)")
+            .withFilterMethodFromSignature("takeWhile(io.reactivex.functions.Predicate<? super T>)")
             // Names and relevant arguments of all the methods of io.reactivex.Observable that
             // behave
             // like .map(...) for the purposes of this checker (the listed arguments are those that
@@ -112,7 +144,8 @@ public class StreamNullabilityPropagatorFactory {
             // and thus propagate
             // the nullability information of the last call.
             .withUseAndPassthroughMethodAllFromName("doOnNext", "accept", ImmutableSet.of(0))
-            .addStreamType(new DescendantOf(Suppliers.typeFromString("io.reactivex.Maybe")))
+            .addStreamType(
+                TypePredicates.isDescendantOf(Suppliers.typeFromString("io.reactivex.Maybe")))
             .withFilterMethodFromSignature("filter(io.reactivex.functions.Predicate<? super T>)")
             .withMapMethodFromSignature(
                 "<R>map(io.reactivex.functions.Function<? super T,? extends R>)",
@@ -122,7 +155,8 @@ public class StreamNullabilityPropagatorFactory {
             .withMapMethodAllFromName("flatMapSingle", "apply", ImmutableSet.of(0))
             .withPassthroughMethodAllFromName("observeOn")
             .withUseAndPassthroughMethodAllFromName("doOnNext", "accept", ImmutableSet.of(0))
-            .addStreamType(new DescendantOf(Suppliers.typeFromString("io.reactivex.Single")))
+            .addStreamType(
+                TypePredicates.isDescendantOf(Suppliers.typeFromString("io.reactivex.Single")))
             .withFilterMethodFromSignature("filter(io.reactivex.functions.Predicate<? super T>)")
             .withMapMethodFromSignature(
                 "<R>map(io.reactivex.functions.Function<? super T,? extends R>)",
@@ -135,5 +169,52 @@ public class StreamNullabilityPropagatorFactory {
             .end();
 
     return new StreamNullabilityPropagator(rxModels);
+  }
+
+  /** Returns a handler for Project Reactor (reactor.core.publisher.*) stream APIs */
+  public static StreamNullabilityPropagator getReactorStreamNullabilityPropagator() {
+    ImmutableList<StreamTypeRecord> reactorModels =
+        StreamModelBuilder.start()
+            .addStreamTypeFromName("reactor.core.publisher.Flux")
+            .withFilterMethodFromSignature("filter(java.util.function.Predicate<? super T>)")
+            .withFilterMethodFromSignature("takeWhile(java.util.function.Predicate<? super T>)")
+            .withMapMethodFromSignature(
+                "<V>map(java.util.function.Function<? super T,? extends V>)",
+                "apply",
+                ImmutableSet.of(0))
+            .withMapMethodAllFromName("flatMap", "apply", ImmutableSet.of(0))
+            .withMapMethodAllFromName("concatMap", "apply", ImmutableSet.of(0))
+            .withUseAndPassthroughMethodFromSignature(
+                "doOnNext(java.util.function.Consumer<? super T>)", "accept", ImmutableSet.of(0))
+            .withPassthroughMethodFromSignature("distinct()")
+            .withPassthroughMethodFromSignature("take(long)")
+            .withPassthroughMethodFromSignature("skip(long)")
+            .withPassthroughMethodAllFromName("distinctUntilChanged")
+            .addStreamTypeFromName("reactor.core.publisher.Mono")
+            .withFilterMethodFromSignature("filter(java.util.function.Predicate<? super T>)")
+            .withMapMethodFromSignature(
+                "<R>map(java.util.function.Function<? super T,? extends R>)",
+                "apply",
+                ImmutableSet.of(0))
+            .withMapMethodAllFromName("flatMap", "apply", ImmutableSet.of(0))
+            .withUseAndPassthroughMethodFromSignature(
+                "doOnNext(java.util.function.Consumer<? super T>)", "accept", ImmutableSet.of(0))
+            .end();
+    return new StreamNullabilityPropagator(reactorModels);
+  }
+
+  /**
+   * Create a new StreamNullabilityPropagator from a list of StreamTypeRecord specs.
+   *
+   * <p>This is used to create a new StreamNullabilityPropagator based on stream API specs provided
+   * by library models.
+   *
+   * @param streamNullabilitySpecs the list of StreamTypeRecord objects defining one or more stream
+   *     APIs (from {@link StreamModelBuilder}).
+   * @return A handler corresponding to the stream APIs defined by the given specs.
+   */
+  public static StreamNullabilityPropagator fromSpecs(
+      ImmutableList<StreamTypeRecord> streamNullabilitySpecs) {
+    return new StreamNullabilityPropagator(streamNullabilitySpecs);
   }
 }

@@ -3,6 +3,7 @@ package com.uber.nullaway.handlers.contract;
 import static com.uber.nullaway.Nullness.NONNULL;
 import static com.uber.nullaway.Nullness.NULLABLE;
 
+import com.google.common.base.Verify;
 import com.google.errorprone.util.ASTHelpers;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.MethodTree;
@@ -34,18 +35,21 @@ public class ContractNullnessStoreInitializer extends NullnessStoreInitializer {
       Context context,
       Types types,
       Config config) {
-    assert underlyingAST.getKind() == UnderlyingAST.Kind.METHOD;
+    Verify.verify(
+        underlyingAST.getKind() == UnderlyingAST.Kind.METHOD,
+        "Expected AST for method but got %s",
+        underlyingAST.getKind());
 
-    final MethodTree methodTree = ((UnderlyingAST.CFGMethod) underlyingAST).getMethod();
-    final ClassTree classTree = ((UnderlyingAST.CFGMethod) underlyingAST).getClassTree();
-    final Symbol.MethodSymbol callee = ASTHelpers.getSymbol(methodTree);
-    final String contractString = ContractUtils.getContractString(callee, config);
+    MethodTree methodTree = ((UnderlyingAST.CFGMethod) underlyingAST).getMethod();
+    ClassTree classTree = ((UnderlyingAST.CFGMethod) underlyingAST).getClassTree();
+    Symbol.MethodSymbol callee = ASTHelpers.getSymbol(methodTree);
+    String[] clauses = ContractUtils.getContractClauses(callee, config);
 
-    assert contractString != null;
+    if (clauses.length == 0) {
+      throw new IllegalStateException("expected a contract clause for method " + callee);
+    }
 
-    String[] clauses = contractString.split(";");
-    String[] parts = clauses[0].split("->");
-    String[] antecedent = parts[0].split(",");
+    String[] antecedent = ContractUtils.parseAntecedent(clauses[0]);
 
     NullnessStore envStore = getEnvNullnessStoreForClass(classTree, context);
     NullnessStore.Builder result = envStore.toBuilder();
@@ -53,8 +57,8 @@ public class ContractNullnessStoreInitializer extends NullnessStoreInitializer {
     for (int i = 0; i < antecedent.length; ++i) {
       String valueConstraint = antecedent[i].trim();
 
-      final LocalVariableNode param = parameters.get(i);
-      final Element element = param.getElement();
+      LocalVariableNode param = parameters.get(i);
+      Element element = param.getElement();
 
       Nullness assumed = NULLABLE;
 

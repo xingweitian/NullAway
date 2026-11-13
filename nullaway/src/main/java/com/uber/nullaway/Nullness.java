@@ -18,9 +18,17 @@
 
 package com.uber.nullaway;
 
+import static com.uber.nullaway.NullabilityUtil.castToNonNull;
+
 import com.sun.tools.javac.code.Symbol;
+import com.sun.tools.javac.code.Type;
+import com.sun.tools.javac.util.List;
+import java.util.EnumMap;
+import java.util.Map;
 import java.util.stream.Stream;
 import javax.lang.model.element.AnnotationMirror;
+import javax.lang.model.element.ElementKind;
+import javax.lang.model.type.TypeKind;
 import org.checkerframework.nullaway.dataflow.analysis.AbstractValue;
 
 /**
@@ -34,15 +42,51 @@ public enum Nullness implements AbstractValue<Nullness> {
    * The lattice for nullness looks like:
    *
    * <pre>
-   *        Nullable
-   *       /        \
-   *   Null          Non-null
-   *        \      /
-   *         Bottom
+   *          Nullable
+   *         /        \
+   *     Null          No-change
+   *         \        /         \
+   *     Null (no-change)     Non-null
+   *              \           /
+   *                 Bottom
    * </pre>
    */
   NULLABLE("Nullable"),
   NULL("Null"),
+  /**
+   * The JSpecify {@code NO_CHANGE} nullness operator applied to a type variable {@code T} with a
+   * nullable upper bound: the value is null only where {@code T} is instantiated with a nullable
+   * type argument. NullAway gives this nullness to a value read through a wildcard or capture
+   * bounded by {@code T}, such as the result of {@code Box<? extends T>.get()}, and to an
+   * enhanced-for element of type {@code T}. It follows the chain of bounds, so for {@code <T
+   * extends @Nullable Object, U extends T>} a read through {@code Box<? extends U>} is {@code
+   * NO_CHANGE}. Where every bound on the chain is non-null, every instantiation of {@code T}
+   * excludes null, so the value is {@link #NONNULL}. Any other value of type {@code T}, such as a
+   * parameter, a field, or the result of {@code List<T>.get()}, is {@link #NONNULL}, so its
+   * dereference is not reported (issue #1727).
+   *
+   * <p>A dereference of the value is reported, since the value is not null-exclusive under every
+   * parameterization. An assignment, an argument, a return, or an array store accepts the value
+   * where nullness subtyping holds: where the target's type is {@code T}, or a capture of {@code ?
+   * super T}, without {@code @NonNull}, as {@link
+   * com.uber.nullaway.generics.GenericsChecks#acceptsNoChangeValue} decides. At any other target
+   * the value is {@link #NULLABLE}, and so is a variable of another type that dataflow assigns it
+   * to. Generic method inference takes no nullness constraint from the value and infers {@code T}.
+   *
+   * <p>NullAway computes this nullness only with {@code HandleWildcardGenerics} on; with that
+   * option off, such a value is {@link #NONNULL}.
+   *
+   * @see <a href="https://jspecify.dev/docs/spec/#nullness-operator">JSpecify: nullness
+   *     operator</a>
+   */
+  NO_CHANGE("No-change"),
+  /**
+   * A {@link #NO_CHANGE} value that dataflow has found equal to null, such as inside {@code if
+   * (value == null)}. A target that accepts a {@code NO_CHANGE} value accepts it too, and
+   * everywhere else it is {@link #NULL}: a dereference is reported, and generic method inference
+   * takes a nullable {@code T} from it.
+   */
+  NULL_NO_CHANGE("Null (no-change)"),
   NONNULL("Non-null"),
   BOTTOM("Bottom");
 
@@ -52,39 +96,119 @@ public enum Nullness implements AbstractValue<Nullness> {
     this.displayName = displayName;
   }
 
-  // The following leastUpperBound and greatestLowerBound methods were created by handwriting a
-  // truth table and then encoding the values into these functions. A better approach would be to
-  // represent the lattice directly and compute these functions from the lattice.
+  /**
+   * Check whether an annotation should be treated as equivalent to <code>@MonotonicNonNull</code>.
+   * For now checks if the simple name of the annotation is {@code MonotonicNonNull}, from any
+   * package, or if the annotation is {@code
+   * org.checkerframework.checker.nullness.compatqual.MonotonicNonNullDecl}.
+   */
+  public static boolean isMonotonicNonNullAnnotation(String annotName) {
+    return annotName.endsWith(".MonotonicNonNull")
+        // no `org.` prefix, for the same reason as NullableDecl in isNullableAnnotation
+        || annotName.endsWith(".checkerframework.checker.nullness.compatqual.MonotonicNonNullDecl");
+  }
+
+  /**
+   * Check for either a {@code @Nullable} annotation or a {@code @MonotonicNonNull} annotation on
+   * {@code symbol}. Used to reason whether a field may be null.
+   */
+  public static boolean hasNullableOrMonotonicNonNullAnnotation(Symbol symbol, Config config) {
+    return NullabilityUtil.hasAnyAnnotationMatchingBackCompat(
+        symbol,
+        annot -> isNullableAnnotation(annot, config) || isMonotonicNonNullAnnotation(annot));
+  }
+
+  /** Returns whether this value is below {@code other} in the lattice, or equal to it. */
+  private boolean isLessThanOrEqualTo(Nullness other) {
+    return this == other
+        || this == BOTTOM
+        || other == NULLABLE
+        || (this == NULL_NO_CHANGE && (other == NULL || other == NO_CHANGE))
+        || (this == NONNULL && other == NO_CHANGE);
+  }
+
+  /** Least upper bound of every pair of values. */
+  private static final Map<Nullness, Map<Nullness, Nullness>> LEAST_UPPER_BOUNDS =
+      boundsTable(/* upper= */ true);
+
+  /** Greatest lower bound of every pair of values. */
+  private static final Map<Nullness, Map<Nullness, Nullness>> GREATEST_LOWER_BOUNDS =
+      boundsTable(/* upper= */ false);
+
+  /**
+   * Computes the least upper bound, or the greatest lower bound, of every pair of values from
+   * {@link #isLessThanOrEqualTo}.
+   *
+   * @param upper {@code true} for least upper bounds, {@code false} for greatest lower bounds
+   * @return the bound of each pair of values
+   */
+  private static Map<Nullness, Map<Nullness, Nullness>> boundsTable(boolean upper) {
+    Nullness[] values = values();
+    Map<Nullness, Map<Nullness, Nullness>> table = new EnumMap<>(Nullness.class);
+    for (Nullness a : values) {
+      Map<Nullness, Nullness> row = new EnumMap<>(Nullness.class);
+      table.put(a, row);
+      for (Nullness b : values) {
+        Nullness best = null;
+        for (Nullness candidate : values) {
+          boolean isBound =
+              upper
+                  ? a.isLessThanOrEqualTo(candidate) && b.isLessThanOrEqualTo(candidate)
+                  : candidate.isLessThanOrEqualTo(a) && candidate.isLessThanOrEqualTo(b);
+          if (isBound
+              && (best == null
+                  || (upper
+                      ? candidate.isLessThanOrEqualTo(best)
+                      : best.isLessThanOrEqualTo(candidate)))) {
+            best = candidate;
+          }
+        }
+        row.put(b, castToNonNull(best));
+      }
+    }
+    return table;
+  }
 
   @Override
   public Nullness leastUpperBound(Nullness other) {
-    if (this == other) {
-      return this;
-    }
-    // Bottom loses.
-    if (this == BOTTOM) {
-      return other;
-    }
-    if (other == BOTTOM) {
-      return this;
-    }
-    // They disagree, and neither is bottom.
-    return NULLABLE;
+    return castToNonNull(castToNonNull(LEAST_UPPER_BOUNDS.get(this)).get(other));
   }
 
+  /**
+   * Returns the greatest lower bound of this value and {@code other} in the lattice: the most
+   * precise value that holds wherever both of them hold.
+   */
   public Nullness greatestLowerBound(Nullness other) {
-    if (this == other) {
-      return this;
-    }
-    // Nullable loses.
-    if (this == NULLABLE) {
-      return other;
-    }
-    if (other == NULLABLE) {
-      return this;
-    }
-    // They disagree, and neither is nullable.
-    return BOTTOM;
+    return castToNonNull(castToNonNull(GREATEST_LOWER_BOUNDS.get(this)).get(other));
+  }
+
+  /**
+   * Returns whether this value is {@link #NO_CHANGE} or {@link #NULL_NO_CHANGE}, which a target
+   * accepts where {@link com.uber.nullaway.generics.GenericsChecks#acceptsNoChangeValue} does.
+   */
+  public boolean isNoChange() {
+    return this == NO_CHANGE || this == NULL_NO_CHANGE;
+  }
+
+  /**
+   * Returns whether this value is known to be null: true for {@link #NULL} and {@link
+   * #NULL_NO_CHANGE}.
+   */
+  public boolean isNull() {
+    return this == NULL || this == NULL_NO_CHANGE;
+  }
+
+  /**
+   * Returns the nullness of this value once it is assigned to a location that does not accept a
+   * {@code NO_CHANGE} value: {@link #NULLABLE} for {@link #NO_CHANGE}, {@link #NULL} for {@link
+   * #NULL_NO_CHANGE}, and this value for any other.
+   */
+  public Nullness withoutNoChange() {
+    return switch (this) {
+      case NO_CHANGE -> NULLABLE;
+      case NULL_NO_CHANGE -> NULL;
+      default -> this;
+    };
   }
 
   /**
@@ -109,18 +233,11 @@ public enum Nullness implements AbstractValue<Nullness> {
    * get the set of all values, or {@code NULLABLE}.
    */
   public Nullness deducedValueWhenNotEqual() {
-    switch (this) {
-      case NULLABLE:
-        return NULLABLE;
-      case NONNULL:
-        return NULLABLE;
-      case NULL:
-        return NONNULL;
-      case BOTTOM:
-        return BOTTOM;
-      default:
-        throw new AssertionError("Inverse of " + this + " not defined");
-    }
+    return switch (this) {
+      case NULLABLE, NO_CHANGE, NONNULL -> NULLABLE;
+      case NULL, NULL_NO_CHANGE -> NONNULL;
+      case BOTTOM -> BOTTOM;
+    };
   }
 
   @Override
@@ -128,14 +245,14 @@ public enum Nullness implements AbstractValue<Nullness> {
     return displayName;
   }
 
-  private static boolean hasNullableAnnotation(
+  public static boolean hasNullableAnnotation(
       Stream<? extends AnnotationMirror> annotations, Config config) {
     return annotations
         .map(anno -> anno.getAnnotationType().toString())
         .anyMatch(anno -> isNullableAnnotation(anno, config));
   }
 
-  private static boolean hasNonNullAnnotation(
+  public static boolean hasNonNullAnnotation(
       Stream<? extends AnnotationMirror> annotations, Config config) {
     return annotations
         .map(anno -> anno.getAnnotationType().toString())
@@ -156,8 +273,17 @@ public enum Nullness implements AbstractValue<Nullness> {
         || annotName.endsWith(".checkerframework.checker.nullness.compatqual.NullableDecl")
         // matches javax.annotation.CheckForNull and edu.umd.cs.findbugs.annotations.CheckForNull
         || annotName.endsWith(".CheckForNull")
+        // matches any of the multiple @ParametricNullness annotations used within Guava (see
+        // https://github.com/google/guava/issues/6126). We check the simple name first and the
+        // package prefix second for boolean short circuiting, as Guava includes many annotations.
+        // We do _not_ match @ParametricNullness annotations in JSpecify mode and rely on generics
+        // checking instead.
+        || (!config.isJSpecifyMode()
+            && annotName.endsWith(".ParametricNullness")
+            && annotName.startsWith("com.google.common."))
         || (config.acknowledgeAndroidRecent()
-            && annotName.equals("androidx.annotation.RecentlyNullable"));
+            && annotName.equals("androidx.annotation.RecentlyNullable"))
+        || config.isCustomNullableAnnotation(annotName);
   }
 
   /**
@@ -166,12 +292,13 @@ public enum Nullness implements AbstractValue<Nullness> {
    * @param annotName annotation name
    * @return true if we treat annotName as a <code>@NonNull</code> annotation, false otherwise
    */
-  private static boolean isNonNullAnnotation(String annotName, Config config) {
+  public static boolean isNonNullAnnotation(String annotName, Config config) {
     return annotName.endsWith(".NonNull")
         || annotName.endsWith(".NotNull")
         || annotName.endsWith(".Nonnull")
         || (config.acknowledgeAndroidRecent()
-            && annotName.equals("androidx.annotation.RecentlyNonNull"));
+            && annotName.equals("androidx.annotation.RecentlyNonNull"))
+        || config.isCustomNonnullAnnotation(annotName);
   }
 
   /**
@@ -182,7 +309,8 @@ public enum Nullness implements AbstractValue<Nullness> {
    * Config)}
    */
   public static boolean hasNonNullAnnotation(Symbol symbol, Config config) {
-    return hasNonNullAnnotation(NullabilityUtil.getAllAnnotations(symbol), config);
+    return NullabilityUtil.hasAnyAnnotationMatchingBackCompat(
+        symbol, annot -> isNonNullAnnotation(annot, config));
   }
 
   /**
@@ -193,26 +321,120 @@ public enum Nullness implements AbstractValue<Nullness> {
    * Config)}
    */
   public static boolean hasNullableAnnotation(Symbol symbol, Config config) {
-    return hasNullableAnnotation(NullabilityUtil.getAllAnnotations(symbol), config);
+    return NullabilityUtil.hasAnyAnnotationMatchingBackCompat(
+        symbol, annot -> isNullableAnnotation(annot, config));
+  }
+
+  private static boolean hasNullableTypeUseAnnotation(Symbol symbol, Config config) {
+    return hasNullableAnnotation(NullabilityUtil.getTypeUseAnnotations(symbol), config);
+  }
+
+  private static boolean hasNonNullTypeUseAnnotation(Symbol symbol, Config config) {
+    return hasNonNullAnnotation(NullabilityUtil.getTypeUseAnnotations(symbol), config);
   }
 
   /**
    * Does the parameter of {@code symbol} at {@code paramInd} have a {@code @Nullable} declaration
    * or type-use annotation? This method works for methods defined in either source or class files.
+   *
+   * <p>For a varargs parameter, this method returns true if <em>individual</em> arguments passed in
+   * the varargs positions can be null.
    */
   public static boolean paramHasNullableAnnotation(
       Symbol.MethodSymbol symbol, int paramInd, Config config) {
-    return hasNullableAnnotation(
-        NullabilityUtil.getAllAnnotationsForParameter(symbol, paramInd), config);
+    // We treat the (generated) equals() method of record types to have a @Nullable parameter, as
+    // the generated implementation handles null (as required by the contract of Object.equals())
+    if (isRecordEqualsParam(symbol, paramInd)) {
+      return true;
+    }
+    if (symbol.isVarArgs() && paramInd == symbol.getParameters().size() - 1) {
+      return NullabilityUtil.nullableVarargsElementsForSourceOrBytecode(
+          symbol.getParameters().get(paramInd), config);
+    } else {
+      return hasNullableAnnotation(
+          NullabilityUtil.getAllAnnotationsForParameter(symbol, paramInd), config);
+    }
+  }
+
+  @SuppressWarnings(
+      "TypeToString") // fixing this will require threading a VisitorState object through many
+  // places
+  private static boolean isRecordEqualsParam(Symbol.MethodSymbol symbol, int paramInd) {
+    if (!symbol.owner.getKind().equals(ElementKind.RECORD)) {
+      return false;
+    }
+    if (!symbol.getSimpleName().contentEquals("equals")) {
+      return false;
+    }
+    // Check for a boolean return type and a single parameter of type java.lang.Object
+    Type type = symbol.type;
+    List<Type> parameterTypes = type.getParameterTypes();
+    if (!(type.getReturnType().getKind() == TypeKind.BOOLEAN
+        && parameterTypes != null
+        && parameterTypes.size() == 1
+        && parameterTypes.get(0).toString().equals("java.lang.Object"))) {
+      return false;
+    }
+    return paramInd == 0;
   }
 
   /**
    * Does the parameter of {@code symbol} at {@code paramInd} have a {@code @NonNull} declaration or
    * type-use annotation? This method works for methods defined in either source or class files.
+   *
+   * <p>For a varargs parameter, this method returns true if <em>individual</em> arguments passed in
+   * the varargs positions must be {@code @NonNull}.
    */
   public static boolean paramHasNonNullAnnotation(
       Symbol.MethodSymbol symbol, int paramInd, Config config) {
-    return hasNonNullAnnotation(
-        NullabilityUtil.getAllAnnotationsForParameter(symbol, paramInd), config);
+    if (symbol.isVarArgs() && paramInd == symbol.getParameters().size() - 1) {
+      return NullabilityUtil.nonnullVarargsElementsForSourceOrBytecode(
+          symbol.getParameters().get(paramInd), config);
+    } else {
+      return hasNonNullAnnotation(
+          NullabilityUtil.getAllAnnotationsForParameter(symbol, paramInd), config);
+    }
+  }
+
+  /**
+   * Does the varargs parameter {@code paramSymbol} have a {@code @Nullable} annotation indicating
+   * that the argument array passed at a call site can be {@code null}? Syntactically, this would be
+   * written as {@code foo(Object @Nullable... args}}
+   */
+  public static boolean varargsArrayIsNullable(Symbol paramSymbol, Config config) {
+    return hasNullableTypeUseAnnotation(paramSymbol, config);
+  }
+
+  /**
+   * Does the varargs parameter {@code paramSymbol} have a {@code @NonNull} annotation indicating
+   * that the argument array passed at a call site cannot be {@code null}? Syntactically, this would
+   * be written as {@code foo(Object @NonNull... args}}
+   */
+  public static boolean varargsArrayIsNonNull(Symbol paramSymbol, Config config) {
+    return hasNonNullTypeUseAnnotation(paramSymbol, config)
+        // For Kotlin-generated class files, we treat the presence of a JetBrains @NotNull
+        // declaration annotation on a varargs parameter as indicating that the varargs array itself
+        // is non-null.  See https://github.com/uber/NullAway/issues/720
+        || NullabilityUtil.hasJetBrainsNotNullDeclarationAnnotation(paramSymbol);
+  }
+
+  /** Checks if the symbol has a {@code @Nullable} declaration annotation */
+  public static boolean hasNullableDeclarationAnnotation(Symbol symbol, Config config) {
+    for (AnnotationMirror annotationMirror : symbol.getRawAttributes()) {
+      if (isNullableAnnotation(annotationMirror.getAnnotationType().toString(), config)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Checks if the symbol has a {@code @NonNull} declaration annotation */
+  public static boolean hasNonNullDeclarationAnnotation(Symbol symbol, Config config) {
+    for (AnnotationMirror annotationMirror : symbol.getRawAttributes()) {
+      if (isNonNullAnnotation(annotationMirror.getAnnotationType().toString(), config)) {
+        return true;
+      }
+    }
+    return false;
   }
 }

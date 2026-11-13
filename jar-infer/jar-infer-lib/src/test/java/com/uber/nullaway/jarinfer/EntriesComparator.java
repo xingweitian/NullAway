@@ -20,6 +20,7 @@ import com.google.common.collect.ImmutableSet;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.jar.JarEntry;
@@ -41,13 +42,13 @@ public class EntriesComparator {
    * @throws IOException if an error happens when reading jar files.
    */
   public static boolean compareEntriesInJars(String jarFile1, String jarFile2) throws IOException {
-    Preconditions.checkArgument(jarFile1.endsWith(".jar"), "invalid jar file: " + jarFile1);
-    Preconditions.checkArgument(jarFile2.endsWith(".jar"), "invalid jar file: " + jarFile2);
+    Preconditions.checkArgument(jarFile1.endsWith(".jar"), "invalid jar file: %s", jarFile1);
+    Preconditions.checkArgument(jarFile2.endsWith(".jar"), "invalid jar file: %s", jarFile2);
     JarFile jar1 = new JarFile(jarFile1);
     JarFile jar2 = new JarFile(jarFile2);
-    Set<String> jar1Entries =
+    ImmutableSet<String> jar1Entries =
         jar1.stream().map(ZipEntry::getName).collect(ImmutableSet.toImmutableSet());
-    Set<String> jar2Entries =
+    ImmutableSet<String> jar2Entries =
         jar2.stream().map(ZipEntry::getName).collect(ImmutableSet.toImmutableSet());
     return jar1Entries.equals(jar2Entries);
   }
@@ -63,13 +64,13 @@ public class EntriesComparator {
    * @throws IOException if an error happens when reading aar files.
    */
   public static boolean compareEntriesInAars(String aarFile1, String aarFile2) throws IOException {
-    Preconditions.checkArgument(aarFile1.endsWith(".aar"), "invalid aar file: " + aarFile1);
-    Preconditions.checkArgument(aarFile2.endsWith(".aar"), "invalid aar file: " + aarFile2);
+    Preconditions.checkArgument(aarFile1.endsWith(".aar"), "invalid aar file: %s", aarFile1);
+    Preconditions.checkArgument(aarFile2.endsWith(".aar"), "invalid aar file: %s", aarFile2);
     ZipFile zip1 = new ZipFile(aarFile1);
     ZipFile zip2 = new ZipFile(aarFile2);
-    Set<String> zip1Entries =
+    ImmutableSet<String> zip1Entries =
         zip1.stream().map(ZipEntry::getName).collect(ImmutableSet.toImmutableSet());
-    Set<String> zip2Entries =
+    ImmutableSet<String> zip2Entries =
         zip2.stream().map(ZipEntry::getName).collect(ImmutableSet.toImmutableSet());
     if (!zip1Entries.equals(zip2Entries)) {
       return false;
@@ -107,7 +108,8 @@ public class EntriesComparator {
     }
     StringBuilder stringBuilder = new StringBuilder();
     BufferedReader bufferedReader =
-        new BufferedReader(new InputStreamReader(jar.getInputStream(manifestEntry), "UTF-8"));
+        new BufferedReader(
+            new InputStreamReader(jar.getInputStream(manifestEntry), StandardCharsets.UTF_8));
     String currentLine;
     while ((currentLine = bufferedReader.readLine()) != null) {
       // Ignore empty new lines
@@ -129,8 +131,8 @@ public class EntriesComparator {
    */
   public static boolean compareManifestContents(String jarFile1, String jarFile2)
       throws IOException {
-    Preconditions.checkArgument(jarFile1.endsWith(".jar"), "invalid jar file: " + jarFile1);
-    Preconditions.checkArgument(jarFile2.endsWith(".jar"), "invalid jar file: " + jarFile2);
+    Preconditions.checkArgument(jarFile1.endsWith(".jar"), "invalid jar file: %s", jarFile1);
+    Preconditions.checkArgument(jarFile2.endsWith(".jar"), "invalid jar file: %s", jarFile2);
     String manifest1 = readManifestFromJar(jarFile1);
     String manifest2 = readManifestFromJar(jarFile2);
     return manifest1.equals(manifest2);

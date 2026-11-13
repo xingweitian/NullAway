@@ -40,11 +40,15 @@ import com.uber.nullaway.annotations.RequiresNonNull;
 import com.uber.nullaway.dataflow.AccessPath;
 import com.uber.nullaway.dataflow.NullnessStore;
 import com.uber.nullaway.handlers.AbstractFieldContractHandler;
+import com.uber.nullaway.handlers.MethodAnalysisContext;
 import com.uber.nullaway.handlers.contract.ContractUtils;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
+import javax.lang.model.element.Element;
+import javax.lang.model.element.Modifier;
 import javax.lang.model.element.VariableElement;
 import org.checkerframework.nullaway.dataflow.cfg.UnderlyingAST;
 import org.checkerframework.nullaway.dataflow.cfg.node.LocalVariableNode;
@@ -71,7 +75,7 @@ public class RequiresNonNullHandler extends AbstractFieldContractHandler {
   /** All methods can add the precondition of {@code RequiresNonNull}. */
   @Override
   protected boolean validateAnnotationSemantics(
-      NullAway analysis, VisitorState state, MethodTree tree, Symbol.MethodSymbol methodSymbol) {
+      MethodTree tree, MethodAnalysisContext methodAnalysisContext) {
     return true;
   }
 
@@ -102,7 +106,7 @@ public class RequiresNonNullHandler extends AbstractFieldContractHandler {
     StringBuilder errorMessage = new StringBuilder();
     errorMessage.append(
         "precondition inheritance is violated, method in child class cannot have a stricter precondition than its closest overridden method, adding @requiresNonNull for fields [");
-    Iterator<String> iterator = overriddenFieldNames.iterator();
+    Iterator<String> iterator = overridingFieldNames.iterator();
     while (iterator.hasNext()) {
       errorMessage.append(iterator.next());
       if (iterator.hasNext()) {
@@ -119,7 +123,8 @@ public class RequiresNonNullHandler extends AbstractFieldContractHandler {
                     ErrorMessage.MessageTypes.WRONG_OVERRIDE_PRECONDITION, errorMessage.toString()),
                 tree,
                 analysis.buildDescription(tree),
-                state));
+                state,
+                null));
   }
 
   /**
@@ -128,23 +133,48 @@ public class RequiresNonNullHandler extends AbstractFieldContractHandler {
    */
   @Override
   public void onMatchMethodInvocation(
-      NullAway analysis,
-      MethodInvocationTree tree,
-      VisitorState state,
-      Symbol.MethodSymbol methodSymbol) {
+      MethodInvocationTree tree, MethodAnalysisContext methodAnalysisContext) {
+
+    VisitorState state = methodAnalysisContext.state();
+    Symbol.MethodSymbol methodSymbol = methodAnalysisContext.methodSymbol();
+    NullAway analysis = methodAnalysisContext.analysis();
     Set<String> fieldNames = getAnnotationValueArray(methodSymbol, annotName, false);
     if (fieldNames == null) {
-      super.onMatchMethodInvocation(analysis, tree, state, methodSymbol);
+      super.onMatchMethodInvocation(tree, methodAnalysisContext);
       return;
     }
     fieldNames = ContractUtils.trimReceivers(fieldNames);
     for (String fieldName : fieldNames) {
       Symbol.ClassSymbol classSymbol = ASTHelpers.enclosingClass(methodSymbol);
       Preconditions.checkNotNull(
-          classSymbol, "Could not find the enclosing class for method symbol: " + methodSymbol);
-      VariableElement field = getInstanceFieldOfClass(classSymbol, fieldName);
+          classSymbol, "Could not find the enclosing class for method symbol: %s", methodSymbol);
+      VariableElement field = getFieldOfClass(classSymbol, fieldName);
       if (field == null) {
         // we will report an error on the method declaration
+        continue;
+      }
+      if (field.getModifiers().contains(Modifier.STATIC)) {
+        Set<Element> nonnullStaticFields =
+            analysis
+                .getNullnessAnalysis(state)
+                .getNonnullStaticFieldsBefore(state.getPath(), state.context);
+
+        if (!nonnullStaticFields.contains(field)) {
+          String message =
+              "Expected static field "
+                  + fieldName
+                  + " to be non-null at call site due to @RequiresNonNull annotation on invoked method";
+          state.reportMatch(
+              analysis
+                  .getErrorBuilder()
+                  .createErrorDescription(
+                      new ErrorMessage(
+                          ErrorMessage.MessageTypes.PRECONDITION_NOT_SATISFIED, message),
+                      tree,
+                      analysis.buildDescription(tree),
+                      state,
+                      null));
+        }
         continue;
       }
       ExpressionTree methodSelectTree = tree.getMethodSelect();
@@ -154,7 +184,10 @@ public class RequiresNonNullHandler extends AbstractFieldContractHandler {
               .getNullnessOfFieldForReceiverTree(
                   state.getPath(), state.context, methodSelectTree, field, true);
       if (NullabilityUtil.nullnessToBool(nullness)) {
-        String message = "Expected field " + fieldName + " to be non-null at call site";
+        String message =
+            "Expected field "
+                + fieldName
+                + " to be non-null at call site due to @RequiresNonNull annotation on invoked method";
 
         state.reportMatch(
             analysis
@@ -163,7 +196,8 @@ public class RequiresNonNullHandler extends AbstractFieldContractHandler {
                     new ErrorMessage(ErrorMessage.MessageTypes.PRECONDITION_NOT_SATISFIED, message),
                     tree,
                     analysis.buildDescription(tree),
-                    state));
+                    state,
+                    null));
       }
     }
   }
@@ -178,24 +212,33 @@ public class RequiresNonNullHandler extends AbstractFieldContractHandler {
       UnderlyingAST underlyingAST,
       List<LocalVariableNode> parameters,
       NullnessStore.Builder result) {
-    if (!(underlyingAST instanceof UnderlyingAST.CFGMethod)) {
+    if (!(underlyingAST instanceof UnderlyingAST.CFGMethod cfgMethod)) {
       return super.onDataflowInitialStore(underlyingAST, parameters, result);
     }
-    MethodTree methodTree = ((UnderlyingAST.CFGMethod) underlyingAST).getMethod();
-    ClassTree classTree = ((UnderlyingAST.CFGMethod) underlyingAST).getClassTree();
+    MethodTree methodTree = cfgMethod.getMethod();
+    ClassTree classTree = cfgMethod.getClassTree();
     Set<String> fieldNames =
         getAnnotationValueArray(ASTHelpers.getSymbol(methodTree), annotName, false);
     if (fieldNames == null) {
       return result;
     }
-    fieldNames = ContractUtils.trimReceivers(fieldNames);
+    Set<String> filteredFieldNames = new HashSet<>();
     for (String fieldName : fieldNames) {
-      VariableElement field = getInstanceFieldOfClass(ASTHelpers.getSymbol(classTree), fieldName);
+      if (!isThisDotStaticField(ASTHelpers.getSymbol(classTree), fieldName)) {
+        filteredFieldNames.add(fieldName);
+      }
+    }
+    filteredFieldNames = ContractUtils.trimReceivers(filteredFieldNames);
+    for (String fieldName : filteredFieldNames) {
+      VariableElement field = getFieldOfClass(ASTHelpers.getSymbol(classTree), fieldName);
       if (field == null) {
         // Invalid annotation, will result in an error during validation. For now, skip field.
         continue;
       }
-      AccessPath accessPath = AccessPath.fromFieldElement(field);
+      AccessPath accessPath =
+          field.getModifiers().contains(Modifier.STATIC)
+              ? AccessPath.fromStaticField(field)
+              : AccessPath.fromFieldElement(field);
       result.setInformation(accessPath, Nullness.NONNULL);
     }
     return result;

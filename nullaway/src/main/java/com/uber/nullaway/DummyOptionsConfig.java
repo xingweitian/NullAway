@@ -27,8 +27,9 @@ import static com.uber.nullaway.ErrorProneCLIFlagsConfig.FL_ANNOTATED_PACKAGES;
 
 import com.google.common.collect.ImmutableSet;
 import com.sun.tools.javac.code.Symbol;
+import com.uber.nullaway.fixserialization.FixSerializationConfig;
 import java.util.Set;
-import javax.annotation.Nullable;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Dummy Config class required for the {@link NullAway} empty constructor.
@@ -40,7 +41,7 @@ import javax.annotation.Nullable;
  */
 public class DummyOptionsConfig implements Config {
 
-  private final String error_msg =
+  public static final String ERROR_MESSAGE =
       "To run the "
           + EP_FL_NAMESPACE
           + " analysis plugin please specify analysis "
@@ -54,134 +55,187 @@ public class DummyOptionsConfig implements Config {
   public DummyOptionsConfig() {}
 
   @Override
-  public boolean fromAnnotatedPackage(Symbol.ClassSymbol symbol) {
-    throw new IllegalStateException(error_msg);
+  public boolean fromExplicitlyAnnotatedPackage(String className) {
+    throw new IllegalStateException(ERROR_MESSAGE);
   }
 
   @Override
-  public boolean isExcludedClass(String className) {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public boolean isUnannotatedClass(Symbol.ClassSymbol symbol) {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public ImmutableSet<String> getExcludedClassAnnotations() {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public boolean exhaustiveOverride() {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public boolean isKnownInitializerMethod(Symbol.MethodSymbol methodSymbol) {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public boolean isExternalInitClassAnnotation(String annotationName) {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public boolean isContractAnnotation(String annotationName) {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public boolean isExcludedFieldAnnotation(String annotationName) {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public boolean isInitializerMethodAnnotation(String annotationName) {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public boolean suggestSuppressions() {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public boolean assertsEnabled() {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public boolean acknowledgeRestrictiveAnnotations() {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public boolean checkOptionalEmptiness() {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public boolean checkContracts() {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public boolean handleTestAssertionLibraries() {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public Set<String> getOptionalClassPaths() {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  @Nullable
-  public String getCastToNonNullMethod() {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public String getAutofixSuppressionComment() {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public boolean isJarInferEnabled() {
-    throw new IllegalStateException(error_msg);
-  }
-
-  /** --- JarInfer configs --- */
-  @Override
-  public boolean isJarInferUseReturnAnnotations() {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public String getJarInferRegexStripModelJarName() {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public String getJarInferRegexStripCodeJarName() {
-    throw new IllegalStateException(error_msg);
-  }
-
-  @Override
-  public String getErrorURL() {
-    throw new IllegalStateException(error_msg);
+  public boolean fromExplicitlyUnannotatedPackage(String className) {
+    throw new IllegalStateException(ERROR_MESSAGE);
   }
 
   @Override
   public boolean treatGeneratedAsUnannotated() {
-    throw new IllegalStateException(error_msg);
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean serializationIsActive() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public FixSerializationConfig getSerializationConfig() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean isExcludedClass(String className) {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean isUnannotatedClass(Symbol.ClassSymbol symbol) {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public ImmutableSet<String> getExcludedClassAnnotations() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public ImmutableSet<String> getGeneratedCodeAnnotations() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean exhaustiveOverride() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean isKnownInitializerMethod(Symbol.MethodSymbol methodSymbol) {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean isExternalInitClassAnnotation(String annotationName) {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean isContractAnnotation(String annotationName) {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean isExcludedFieldAnnotation(String annotationName) {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean isInitializerMethodAnnotation(String annotationName) {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean isCustomNullableAnnotation(String annotationName) {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean isCustomNonnullAnnotation(String annotationName) {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean suggestSuppressions() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean assertsEnabled() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean acknowledgeRestrictiveAnnotations() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean checkOptionalEmptiness() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean checkContracts() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean handleTestAssertionLibraries() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public Set<String> getOptionalClassPaths() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public @Nullable String getCastToNonNullMethod() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public Set<String> getSuppressionNameAliases() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public String getAutofixSuppressionComment() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean isSkippedLibraryModel(String classDotMethod) {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public Set<String> getExtraFuturesClasses() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean isJarInferEnabled() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean isJSpecifyJDKModels() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public String getErrorURL() {
+    throw new IllegalStateException(ERROR_MESSAGE);
   }
 
   @Override
   public boolean acknowledgeAndroidRecent() {
-    throw new IllegalStateException(error_msg);
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean isJSpecifyMode() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean isPolyNullLibraryModelsEnabled() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean handleWildcardGenerics() {
+    throw new IllegalStateException(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean warnOnGenericInferenceFailure() {
+    throw new IllegalStateException(ERROR_MESSAGE);
   }
 }

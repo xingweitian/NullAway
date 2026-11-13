@@ -28,7 +28,12 @@ import static com.uber.nullaway.handlers.contract.ContractUtils.getConsequent;
 import com.google.common.base.Preconditions;
 import com.google.errorprone.VisitorState;
 import com.google.errorprone.util.ASTHelpers;
+import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.ConditionalExpressionTree;
+import com.sun.source.tree.ExpressionTree;
+import com.sun.source.tree.LambdaExpressionTree;
 import com.sun.source.tree.MethodTree;
+import com.sun.source.tree.ParenthesizedTree;
 import com.sun.source.tree.ReturnTree;
 import com.sun.source.util.TreePath;
 import com.sun.source.util.TreePathScanner;
@@ -36,11 +41,19 @@ import com.sun.tools.javac.code.Symbol;
 import com.uber.nullaway.Config;
 import com.uber.nullaway.ErrorMessage;
 import com.uber.nullaway.NullAway;
+import com.uber.nullaway.NullabilityUtil;
 import com.uber.nullaway.Nullness;
-import com.uber.nullaway.handlers.BaseNoOpHandler;
+import com.uber.nullaway.dataflow.AccessPathNullnessAnalysis;
+import com.uber.nullaway.handlers.Handler;
+import com.uber.nullaway.handlers.MethodAnalysisContext;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+import org.jspecify.annotations.Nullable;
 
 /**
- * This Handler parses the jetbrains @Contract annotation and tries to check if the contract is
+ * This Handler parses @Contract-style annotations (JetBrains or any annotation with simple name
+ * "Contract", plus any configured custom annotations) and tries to check if the contract is
  * followed.
  *
  * <p>Currently, it supports the case when there is only one clause in the contract. The clause of
@@ -49,103 +62,134 @@ import com.uber.nullaway.handlers.BaseNoOpHandler;
  * antecedent if the consequent is "!null" and there is a return statement with "nullable" or "null"
  * expression.
  */
-public class ContractCheckHandler extends BaseNoOpHandler {
+public class ContractCheckHandler implements Handler {
 
   private final Config config;
+
+  /** A set of value constraints in the antecedent which we can check for now. */
+  private final Set<String> checkableValueConstraints = Set.of("_", "null", "!null");
+
+  /** All known valid value constraints */
+  private final Set<String> allValidValueConstraints =
+      Set.of("_", "null", "!null", "true", "false");
 
   public ContractCheckHandler(Config config) {
     this.config = config;
   }
 
+  /**
+   * Perform checks on any {@code @Contract} annotations on the method. By default, we check for
+   * syntactic well-formedness of the annotation. If {@code config.checkContracts()} is true, we
+   * also check that the method body is consistent with contracts whose value constraints are one of
+   * "_", "null", or "!null" in the antecedent and "!null" in the consequent.
+   *
+   * @param tree The AST node for the method being matched.
+   * @param methodAnalysisContext The MethodAnalysisContext object
+   */
   @Override
-  public void onMatchMethod(
-      NullAway analysis, MethodTree tree, VisitorState state, Symbol.MethodSymbol methodSymbol) {
+  public void onMatchMethod(MethodTree tree, MethodAnalysisContext methodAnalysisContext) {
     Symbol.MethodSymbol callee = ASTHelpers.getSymbol(tree);
     Preconditions.checkNotNull(callee);
     // Check to see if this method has an @Contract annotation
-    String contractString = ContractUtils.getContractString(callee, config);
-    if (contractString != null) {
-      // Found a contract, lets parse it.
-      String[] clauses = contractString.split(";");
-      if (clauses.length != 1) {
-        return;
-      }
-
+    String[] clauses = ContractUtils.getContractClauses(callee, config);
+    if (clauses.length == 1) {
       String clause = clauses[0];
+      NullAway analysis = methodAnalysisContext.analysis();
+      VisitorState state = methodAnalysisContext.state();
       String[] antecedent =
           getAntecedent(clause, tree, analysis, state, callee, tree.getParameters().size());
       String consequent = getConsequent(clause, tree, analysis, state, callee);
+      if (antecedent == null) {
+        return;
+      }
 
-      boolean supported = true;
+      boolean checkMethodBody = config.checkContracts();
 
       for (int i = 0; i < antecedent.length; ++i) {
         String valueConstraint = antecedent[i].trim();
-        if (!(valueConstraint.equals("_")
-            || valueConstraint.equals("!null")
-            || valueConstraint.equals("null"))) {
-          supported = false;
+        if (!allValidValueConstraints.contains(valueConstraint)) {
+          String errorMessage =
+              "Invalid @Contract annotation detected for method "
+                  + callee
+                  + ". It contains the following unparseable clause: "
+                  + clause
+                  + " (unknown value constraint: "
+                  + valueConstraint
+                  + ", see https://www.jetbrains.com/help/idea/contract-annotations.html).";
+          state.reportMatch(
+              analysis
+                  .getErrorBuilder()
+                  .createErrorDescription(
+                      new ErrorMessage(
+                          ErrorMessage.MessageTypes.ANNOTATION_VALUE_INVALID, errorMessage),
+                      tree,
+                      analysis.buildDescription(tree),
+                      state,
+                      null));
+          checkMethodBody = false;
+        } else if (!checkableValueConstraints.contains(valueConstraint)) {
+          checkMethodBody = false;
         }
       }
 
       if (!consequent.equals("!null")) {
-        supported = false;
+        checkMethodBody = false;
       }
 
-      if (!supported) {
+      if (!checkMethodBody) {
         return;
       }
 
       // we scan the method tree for the return nodes and check the contract
-      new TreePathScanner<Void, Void>() {
+      new TreePathScanner<@Nullable Void, @Nullable Void>() {
+
         @Override
-        public Void visitReturn(ReturnTree returnTree, Void unused) {
+        public @Nullable Void visitLambdaExpression(
+            LambdaExpressionTree node, @Nullable Void unused) {
+          // do not scan into lambdas
+          return null;
+        }
 
-          final VisitorState returnState = state.withPath(getCurrentPath());
-          final Nullness nullness =
-              analysis
-                  .getNullnessAnalysis(returnState)
-                  .getNullnessForContractDataflow(
-                      new TreePath(returnState.getPath(), returnTree.getExpression()),
-                      returnState.context);
+        @Override
+        public @Nullable Void visitClass(ClassTree node, @Nullable Void unused) {
+          // do not scan into local/anonymous classes
+          return null;
+        }
 
-          if (nullness == Nullness.NULLABLE || nullness == Nullness.NULL) {
+        @Override
+        public @Nullable Void visitReturn(ReturnTree returnTree, @Nullable Void unused) {
 
-            String errorMessage;
+          ExpressionTree returnExpression = returnTree.getExpression();
+          if (returnExpression == null) {
+            // this should only be possible with an invalid @Contract on a void-returning method
+            return null;
+          }
+          TreePath returnExpressionPath = new TreePath(getCurrentPath(), returnExpression);
+          AccessPathNullnessAnalysis nullnessAnalysis = analysis.getNullnessAnalysis(state);
+          List<TreePath> allPossiblyReturnedExpressions = new ArrayList<>();
+          collectNestedReturnedExpressions(returnExpressionPath, allPossiblyReturnedExpressions);
 
-            // used for error message
-            int nonNullAntecedentCount = 0;
-            int nonNullAntecedentPosition = -1;
-
-            for (int i = 0; i < antecedent.length; ++i) {
-              String valueConstraint = antecedent[i].trim();
-
-              if (valueConstraint.equals("!null")) {
-                nonNullAntecedentCount += 1;
-                nonNullAntecedentPosition = i;
+          boolean contractViolated = false;
+          for (TreePath expressionPath : allPossiblyReturnedExpressions) {
+            Nullness nullness =
+                nullnessAnalysis.getNullnessForContractDataflow(expressionPath, state.context);
+            if (nullness != null // diff-coverage: ignore -- dataflow computes every returned value
+                && NullabilityUtil.nullnessToBool(nullness)) {
+              if (nullnessAnalysis.isUnreachableForContractDataflow(
+                  expressionPath, state.context)) {
+                // The contract antecedent makes this branch unreachable.
+                continue;
               }
+              contractViolated = true;
+              break;
             }
+          }
 
-            if (nonNullAntecedentCount == 1) {
+          if (contractViolated) {
+            String errorMessage =
+                getErrorMessageForViolatedContract(antecedent, callee, clause, tree);
 
-              errorMessage =
-                  "Method "
-                      + callee.name
-                      + " has @Contract("
-                      + contractString
-                      + "), but this appears to be violated, as a @Nullable value may be returned when parameter "
-                      + tree.getParameters().get(nonNullAntecedentPosition).getName()
-                      + " is non-null.";
-            } else {
-              errorMessage =
-                  "Method "
-                      + callee.name
-                      + " has @Contract("
-                      + contractString
-                      + "), but this appears to be violated, as a @Nullable value may be returned "
-                      + "when the contract preconditions are true.";
-            }
-
-            returnState.reportMatch(
+            state.reportMatch(
                 analysis
                     .getErrorBuilder()
                     .createErrorDescription(
@@ -153,11 +197,75 @@ public class ContractCheckHandler extends BaseNoOpHandler {
                             ErrorMessage.MessageTypes.ANNOTATION_VALUE_INVALID, errorMessage),
                         returnTree,
                         analysis.buildDescription(returnTree),
-                        returnState));
+                        state,
+                        null));
           }
-          return super.visitReturn(returnTree, unused);
+          return super.visitReturn(returnTree, null);
         }
       }.scan(state.getPath(), null);
     }
+  }
+
+  private static String getErrorMessageForViolatedContract(
+      String[] antecedent, Symbol.MethodSymbol callee, String clause, MethodTree tree) {
+    String errorMessage;
+
+    // used for error message
+    int nonNullAntecedentCount = 0;
+    int nonNullAntecedentPosition = -1;
+
+    for (int i = 0; i < antecedent.length; ++i) {
+      String valueConstraint = antecedent[i].trim();
+
+      if (valueConstraint.equals("!null")) {
+        nonNullAntecedentCount += 1;
+        nonNullAntecedentPosition = i;
+      }
+    }
+
+    if (nonNullAntecedentCount == 1) {
+      errorMessage =
+          "Method "
+              + callee.name
+              + " has @Contract("
+              + clause
+              + "), but this appears to be violated, as a @Nullable value may be returned when parameter "
+              + tree.getParameters().get(nonNullAntecedentPosition).getName()
+              + " is non-null.";
+    } else {
+      errorMessage =
+          "Method "
+              + callee.name
+              + " has @Contract("
+              + clause
+              + "), but this appears to be violated, as a @Nullable value may be returned "
+              + "when the contract preconditions are true.";
+    }
+    return errorMessage;
+  }
+
+  /**
+   * Collect {@code TreePath}s to all nested expressions that may be returned, recursing through
+   * parenthesized expressions and conditional expressions.
+   *
+   * @param expressionPath the TreePath to an expression being returned
+   * @param output output parameter list to collect nested returned expression TreePaths
+   */
+  private static void collectNestedReturnedExpressions(
+      TreePath expressionPath, List<TreePath> output) {
+    ExpressionTree expression = (ExpressionTree) expressionPath.getLeaf();
+    while (expression instanceof ParenthesizedTree parenthesizedTree) {
+      ExpressionTree nestedExpression = parenthesizedTree.getExpression();
+      expressionPath = new TreePath(expressionPath, nestedExpression);
+      expression = nestedExpression;
+    }
+    if (expression instanceof ConditionalExpressionTree conditionalExpression) {
+      TreePath truePath = new TreePath(expressionPath, conditionalExpression.getTrueExpression());
+      TreePath falsePath = new TreePath(expressionPath, conditionalExpression.getFalseExpression());
+      collectNestedReturnedExpressions(truePath, output);
+      collectNestedReturnedExpressions(falsePath, output);
+      return;
+    }
+    output.add(expressionPath);
   }
 }

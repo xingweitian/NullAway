@@ -23,12 +23,6 @@
 package com.uber.nullaway.jmh;
 
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.List;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.Scope;
 import org.openjdk.jmh.annotations.Setup;
@@ -38,23 +32,15 @@ import org.openjdk.jmh.infra.Blackhole;
 @State(Scope.Benchmark)
 public class AutodisposeBenchmark {
 
-  private NullawayJavac nullawayJavac;
+  private AutodisposeCompiler compiler;
 
   @Setup
   public void setup() throws IOException {
-    String sourceDir = System.getProperty("nullaway.autodispose.sources");
-    String classpath = System.getProperty("nullaway.autodispose.classpath");
-    try (Stream<Path> stream =
-        Files.find(
-            Paths.get(sourceDir), 100, (p, bfa) -> p.getFileName().toString().endsWith(".java"))) {
-      List<String> sourceFileNames =
-          stream.map(p -> p.toFile().getAbsolutePath()).collect(Collectors.toList());
-      nullawayJavac = NullawayJavac.create(sourceFileNames, "autodispose2", classpath);
-    }
+    compiler = new AutodisposeCompiler();
   }
 
   @Benchmark
-  public void compile(Blackhole bh) throws Exception {
-    bh.consume(nullawayJavac.compile());
+  public void compile(Blackhole bh) {
+    bh.consume(compiler.compile());
   }
 }

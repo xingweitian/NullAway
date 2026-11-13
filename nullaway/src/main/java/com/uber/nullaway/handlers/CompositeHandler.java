@@ -22,29 +22,43 @@
 
 package com.uber.nullaway.handlers;
 
+import static com.uber.nullaway.handlers.AccessPathPredicates.FALSE_AP_PREDICATE;
+import static com.uber.nullaway.handlers.AccessPathPredicates.TRUE_AP_PREDICATE;
+
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.errorprone.VisitorState;
-import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.LambdaExpressionTree;
 import com.sun.source.tree.MemberReferenceTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.ReturnTree;
+import com.sun.source.util.TreePath;
 import com.sun.tools.javac.code.Symbol;
+import com.sun.tools.javac.code.Type;
 import com.sun.tools.javac.code.Types;
 import com.sun.tools.javac.util.Context;
 import com.uber.nullaway.ErrorMessage;
+import com.uber.nullaway.LibraryModels.PolyNullLocation;
+import com.uber.nullaway.MethodParameterNullness;
 import com.uber.nullaway.NullAway;
+import com.uber.nullaway.Nullness;
 import com.uber.nullaway.dataflow.AccessPath;
+import com.uber.nullaway.dataflow.AccessPathNullnessAnalysis;
 import com.uber.nullaway.dataflow.AccessPathNullnessPropagation;
 import com.uber.nullaway.dataflow.NullnessStore;
+import com.uber.nullaway.dataflow.cfg.NullAwayCFGBuilder;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Predicate;
 import org.checkerframework.nullaway.dataflow.cfg.UnderlyingAST;
+import org.checkerframework.nullaway.dataflow.cfg.node.FieldAccessNode;
 import org.checkerframework.nullaway.dataflow.cfg.node.LocalVariableNode;
 import org.checkerframework.nullaway.dataflow.cfg.node.MethodInvocationNode;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Registry of all handlers registered on our analysis.
@@ -54,7 +68,7 @@ import org.checkerframework.nullaway.dataflow.cfg.node.MethodInvocationNode;
  */
 class CompositeHandler implements Handler {
 
-  private final List<Handler> handlers;
+  private final ImmutableList<Handler> handlers;
 
   CompositeHandler(ImmutableList<Handler> handlers) {
     // Attach default handlers
@@ -62,51 +76,62 @@ class CompositeHandler implements Handler {
   }
 
   @Override
-  public void onMatchTopLevelClass(
-      NullAway analysis, ClassTree tree, VisitorState state, Symbol.ClassSymbol classSymbol) {
+  public void onMatchCompilationUnit(
+      NullAway analysis, CompilationUnitTree tree, VisitorState state) {
     for (Handler h : handlers) {
-      h.onMatchTopLevelClass(analysis, tree, state, classSymbol);
+      h.onMatchCompilationUnit(analysis, tree, state);
     }
   }
 
   @Override
-  public void onMatchMethod(
-      NullAway analysis, MethodTree tree, VisitorState state, Symbol.MethodSymbol methodSymbol) {
+  public void onMatchMethod(MethodTree tree, MethodAnalysisContext methodAnalysisContext) {
     for (Handler h : handlers) {
-      h.onMatchMethod(analysis, tree, state, methodSymbol);
+      h.onMatchMethod(tree, methodAnalysisContext);
     }
   }
 
   @Override
   public void onMatchLambdaExpression(
-      NullAway analysis,
-      LambdaExpressionTree tree,
-      VisitorState state,
-      Symbol.MethodSymbol methodSymbol) {
+      LambdaExpressionTree tree, MethodAnalysisContext methodAnalysisContext) {
     for (Handler h : handlers) {
-      h.onMatchLambdaExpression(analysis, tree, state, methodSymbol);
+      h.onMatchLambdaExpression(tree, methodAnalysisContext);
     }
   }
 
   @Override
   public void onMatchMethodReference(
-      NullAway analysis,
-      MemberReferenceTree tree,
-      VisitorState state,
-      Symbol.MethodSymbol methodSymbol) {
+      MemberReferenceTree tree, MethodAnalysisContext methodAnalysisContext) {
     for (Handler h : handlers) {
-      h.onMatchMethodReference(analysis, tree, state, methodSymbol);
+      h.onMatchMethodReference(tree, methodAnalysisContext);
     }
   }
 
   @Override
-  public void onMatchMethodInvocation(
-      NullAway analysis,
-      MethodInvocationTree tree,
-      VisitorState state,
-      Symbol.MethodSymbol methodSymbol) {
+  public NullnessHint onMethodReferenceReturnNullnessHint(
+      Symbol.MethodSymbol referencedMethod,
+      Symbol.MethodSymbol functionalInterfaceMethod,
+      Type.MethodType functionalInterfaceMethodType,
+      boolean isUnbound,
+      VisitorState state) {
+    NullnessHint result = NullnessHint.UNKNOWN;
     for (Handler h : handlers) {
-      h.onMatchMethodInvocation(analysis, tree, state, methodSymbol);
+      result =
+          result.merge(
+              h.onMethodReferenceReturnNullnessHint(
+                  referencedMethod,
+                  functionalInterfaceMethod,
+                  functionalInterfaceMethodType,
+                  isUnbound,
+                  state));
+    }
+    return result;
+  }
+
+  @Override
+  public void onMatchMethodInvocation(
+      MethodInvocationTree tree, MethodAnalysisContext methodAnalysisContext) {
+    for (Handler h : handlers) {
+      h.onMatchMethodInvocation(tree, methodAnalysisContext);
     }
   }
 
@@ -118,49 +143,53 @@ class CompositeHandler implements Handler {
   }
 
   @Override
-  public ImmutableSet<Integer> onUnannotatedInvocationGetExplicitlyNullablePositions(
+  public Nullness onOverrideMethodReturnNullability(
+      Symbol.MethodSymbol methodSymbol,
+      VisitorState state,
+      boolean isAnnotated,
+      Nullness returnNullness) {
+    for (Handler h : handlers) {
+      returnNullness =
+          h.onOverrideMethodReturnNullability(methodSymbol, state, isAnnotated, returnNullness);
+    }
+    return returnNullness;
+  }
+
+  @Override
+  public boolean onOverrideFieldNullability(Symbol field) {
+    for (Handler h : handlers) {
+      if (h.onOverrideFieldNullability(field)) {
+        // If any handler determines that the field is @Nullable, we should acknowledge that and
+        // treat it as such.
+        return true;
+      }
+    }
+    return false;
+  }
+
+  @Override
+  public MethodParameterNullness onOverrideMethodInvocationParametersNullability(
       Context context,
       Symbol.MethodSymbol methodSymbol,
-      ImmutableSet<Integer> explicitlyNullablePositions) {
+      boolean isAnnotated,
+      MethodParameterNullness argumentNullness) {
     for (Handler h : handlers) {
-      explicitlyNullablePositions =
-          h.onUnannotatedInvocationGetExplicitlyNullablePositions(
-              context, methodSymbol, explicitlyNullablePositions);
+      argumentNullness =
+          h.onOverrideMethodInvocationParametersNullability(
+              context, methodSymbol, isAnnotated, argumentNullness);
     }
-    return explicitlyNullablePositions;
-  }
-
-  @Override
-  public boolean onUnannotatedInvocationGetExplicitlyNonNullReturn(
-      Symbol.MethodSymbol methodSymbol, boolean explicitlyNonNullReturn) {
-    for (Handler h : handlers) {
-      explicitlyNonNullReturn =
-          h.onUnannotatedInvocationGetExplicitlyNonNullReturn(
-              methodSymbol, explicitlyNonNullReturn);
-    }
-    return explicitlyNonNullReturn;
-  }
-
-  @Override
-  public ImmutableSet<Integer> onUnannotatedInvocationGetNonNullPositions(
-      NullAway analysis,
-      VisitorState state,
-      Symbol.MethodSymbol methodSymbol,
-      List<? extends ExpressionTree> actualParams,
-      ImmutableSet<Integer> nonNullPositions) {
-    for (Handler h : handlers) {
-      nonNullPositions =
-          h.onUnannotatedInvocationGetNonNullPositions(
-              analysis, state, methodSymbol, actualParams, nonNullPositions);
-    }
-    return nonNullPositions;
+    return argumentNullness;
   }
 
   @Override
   public boolean onOverrideMayBeNullExpr(
-      NullAway analysis, ExpressionTree expr, VisitorState state, boolean exprMayBeNull) {
+      NullAway analysis,
+      ExpressionTree expr,
+      @Nullable Symbol exprSymbol,
+      VisitorState state,
+      boolean exprMayBeNull) {
     for (Handler h : handlers) {
-      exprMayBeNull = h.onOverrideMayBeNullExpr(analysis, expr, state, exprMayBeNull);
+      exprMayBeNull = h.onOverrideMayBeNullExpr(analysis, expr, exprSymbol, state, exprMayBeNull);
     }
     return exprMayBeNull;
   }
@@ -179,8 +208,8 @@ class CompositeHandler implements Handler {
   @Override
   public NullnessHint onDataflowVisitMethodInvocation(
       MethodInvocationNode node,
-      Types types,
-      Context context,
+      Symbol.MethodSymbol symbol,
+      VisitorState state,
       AccessPath.AccessPathContext apContext,
       AccessPathNullnessPropagation.SubNodeValues inputs,
       AccessPathNullnessPropagation.Updates thenUpdates,
@@ -190,7 +219,25 @@ class CompositeHandler implements Handler {
     for (Handler h : handlers) {
       NullnessHint n =
           h.onDataflowVisitMethodInvocation(
-              node, types, context, apContext, inputs, thenUpdates, elseUpdates, bothUpdates);
+              node, symbol, state, apContext, inputs, thenUpdates, elseUpdates, bothUpdates);
+      nullnessHint = nullnessHint.merge(n);
+    }
+    return nullnessHint;
+  }
+
+  @Override
+  public NullnessHint onDataflowVisitFieldAccess(
+      FieldAccessNode node,
+      Symbol symbol,
+      Types types,
+      Context context,
+      AccessPath.AccessPathContext apContext,
+      AccessPathNullnessPropagation.SubNodeValues inputs,
+      AccessPathNullnessPropagation.Updates updates) {
+    NullnessHint nullnessHint = NullnessHint.UNKNOWN;
+    for (Handler h : handlers) {
+      NullnessHint n =
+          h.onDataflowVisitFieldAccess(node, symbol, types, context, apContext, inputs, updates);
       nullnessHint = nullnessHint.merge(n);
     }
     return nullnessHint;
@@ -218,18 +265,32 @@ class CompositeHandler implements Handler {
     Optional<ErrorMessage> optionalErrorMessage;
     for (Handler h : handlers) {
       optionalErrorMessage = h.onExpressionDereference(expr, baseExpr, state);
-      if (optionalErrorMessage.isPresent()) return optionalErrorMessage;
+      if (optionalErrorMessage.isPresent()) {
+        return optionalErrorMessage;
+      }
     }
     return Optional.empty();
   }
 
   @Override
-  public boolean includeApInfoInSavedContext(AccessPath accessPath, VisitorState state) {
-    boolean shouldFilter = false;
+  public Predicate<AccessPath> getAccessPathPredicateForNestedMethod(
+      TreePath path, VisitorState state) {
+    Predicate<AccessPath> filter = FALSE_AP_PREDICATE;
     for (Handler h : handlers) {
-      shouldFilter |= h.includeApInfoInSavedContext(accessPath, state);
+      Predicate<AccessPath> curFilter = h.getAccessPathPredicateForNestedMethod(path, state);
+      // here we do some optimization, to try to avoid unnecessarily returning a deeply nested
+      // Predicate object (which would be more costly to test)
+      if (!Objects.equals(curFilter, FALSE_AP_PREDICATE)) {
+        if (Objects.equals(curFilter, TRUE_AP_PREDICATE)) {
+          return curFilter;
+        } else if (Objects.equals(filter, FALSE_AP_PREDICATE)) {
+          filter = curFilter;
+        } else {
+          filter = filter.or(curFilter);
+        }
+      }
     }
-    return shouldFilter;
+    return filter;
   }
 
   @Override
@@ -239,5 +300,154 @@ class CompositeHandler implements Handler {
       builder.addAll(h.onRegisterImmutableTypes());
     }
     return builder.build();
+  }
+
+  @Override
+  public void onNonNullFieldAssignment(
+      Symbol field, AccessPathNullnessAnalysis analysis, VisitorState state) {
+    for (Handler h : handlers) {
+      h.onNonNullFieldAssignment(field, analysis, state);
+    }
+  }
+
+  @Override
+  public MethodInvocationNode onCFGBuildPhase1AfterVisitMethodInvocation(
+      NullAwayCFGBuilder.NullAwayCFGTranslationPhaseOne phase,
+      MethodInvocationTree tree,
+      MethodInvocationNode originalNode) {
+    MethodInvocationNode currentNode = originalNode;
+    for (Handler h : handlers) {
+      currentNode = h.onCFGBuildPhase1AfterVisitMethodInvocation(phase, tree, currentNode);
+    }
+    return currentNode;
+  }
+
+  @Override
+  public @Nullable Integer castToNonNullArgumentPositionsForMethod(
+      List<? extends ExpressionTree> actualParams,
+      @Nullable Integer previousArgumentPosition,
+      MethodAnalysisContext methodAnalysisContext) {
+    for (Handler h : handlers) {
+      previousArgumentPosition =
+          h.castToNonNullArgumentPositionsForMethod(
+              actualParams, previousArgumentPosition, methodAnalysisContext);
+    }
+    return previousArgumentPosition;
+  }
+
+  /** Returns true if any handler returns true. */
+  @Override
+  public boolean onOverrideClassTypeVariableUpperBound(String className, int index) {
+    boolean result = false;
+    for (Handler h : handlers) {
+      result = h.onOverrideClassTypeVariableUpperBound(className, index);
+      if (result) {
+        break;
+      }
+    }
+    return result;
+  }
+
+  /** Returns true if any handler returns true. */
+  @Override
+  public boolean onOverrideMethodTypeVariableUpperBound(
+      Symbol.MethodSymbol methodSymbol, int index, VisitorState state) {
+    boolean result = false;
+    for (Handler h : handlers) {
+      result = h.onOverrideMethodTypeVariableUpperBound(methodSymbol, index, state);
+      if (result) {
+        break;
+      }
+    }
+    return result;
+  }
+
+  /** Returns true if any handler returns true. */
+  @Override
+  public boolean onOverrideNullMarkedClasses(String className) {
+    boolean result = false;
+    for (Handler h : handlers) {
+      result = h.onOverrideNullMarkedClasses(className);
+      if (result) {
+        break;
+      }
+    }
+    return result;
+  }
+
+  @Override
+  public boolean onOverrideMethodNullMarkedness(
+      Symbol.MethodSymbol methodSymbol, boolean currentNullMarkedness) {
+    boolean result = currentNullMarkedness;
+    for (Handler h : handlers) {
+      result = h.onOverrideMethodNullMarkedness(methodSymbol, result);
+    }
+    return result;
+  }
+
+  @Override
+  public Type.MethodType onOverrideMethodType(
+      Symbol.MethodSymbol methodSymbol,
+      Type.MethodType methodType,
+      VisitorState state,
+      @Nullable MethodInvocationTree invocationTree) {
+    Type.MethodType currentType = methodType;
+    for (Handler h : handlers) {
+      currentType = h.onOverrideMethodType(methodSymbol, currentType, state, invocationTree);
+    }
+    return currentType;
+  }
+
+  @Override
+  public ImmutableSet<PolyNullLocation> onGetPolyNullLocations(
+      Symbol.MethodSymbol methodSymbol, VisitorState state) {
+    ImmutableSet<PolyNullLocation> result = ImmutableSet.of();
+    Handler previousOwner = null;
+    for (Handler h : handlers) {
+      ImmutableSet<PolyNullLocation> locations = h.onGetPolyNullLocations(methodSymbol, state);
+      if (locations.isEmpty()) {
+        continue;
+      }
+      PolyNullLocation.validateNoReceiverLocations(locations, String.valueOf(methodSymbol));
+      if (previousOwner != null) {
+        throw new IllegalArgumentException(
+            "Multiple handlers provide PolyNull locations for "
+                + methodSymbol
+                + ": "
+                + previousOwner.getClass().getName()
+                + " and "
+                + h.getClass().getName());
+      }
+      PolyNullLocation.validateHasNestedLocation(locations, String.valueOf(methodSymbol));
+      previousOwner = h;
+      result = locations;
+    }
+    return result;
+  }
+
+  @Override
+  public FieldSkipResult shouldSkipFieldInitializationCheck(
+      Symbol.ClassSymbol classSymbol, Symbol fieldSymbol, VisitorState state) {
+    FieldSkipResult result = FieldSkipResult.NO;
+    for (Handler h : handlers) {
+      result =
+          FieldSkipResult.combine(
+              result, h.shouldSkipFieldInitializationCheck(classSymbol, fieldSymbol, state));
+      if (result == FieldSkipResult.YES) {
+        return result;
+      }
+    }
+    return result;
+  }
+
+  @Override
+  public boolean isSingleArgNullImpliesFalseMethod(
+      Symbol.MethodSymbol methodSymbol, VisitorState state) {
+    for (Handler h : handlers) {
+      if (h.isSingleArgNullImpliesFalseMethod(methodSymbol, state)) {
+        return true;
+      }
+    }
+    return false;
   }
 }

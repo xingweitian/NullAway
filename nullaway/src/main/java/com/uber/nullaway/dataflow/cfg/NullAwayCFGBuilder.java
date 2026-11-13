@@ -1,0 +1,280 @@
+package com.uber.nullaway.dataflow.cfg;
+
+import com.google.common.base.Preconditions;
+import com.sun.source.tree.EnhancedForLoopTree;
+import com.sun.source.tree.ExpressionTree;
+import com.sun.source.tree.LiteralTree;
+import com.sun.source.tree.MethodInvocationTree;
+import com.sun.source.tree.ThrowTree;
+import com.sun.source.tree.Tree;
+import com.sun.source.tree.TreeVisitor;
+import com.sun.source.tree.VariableTree;
+import com.sun.source.util.TreePath;
+import com.uber.nullaway.generics.GenericsChecks;
+import com.uber.nullaway.handlers.Handler;
+import javax.annotation.processing.ProcessingEnvironment;
+import javax.lang.model.type.TypeMirror;
+import org.checkerframework.nullaway.dataflow.cfg.ControlFlowGraph;
+import org.checkerframework.nullaway.dataflow.cfg.UnderlyingAST;
+import org.checkerframework.nullaway.dataflow.cfg.builder.CFGBuilder;
+import org.checkerframework.nullaway.dataflow.cfg.builder.CFGTranslationPhaseOne;
+import org.checkerframework.nullaway.dataflow.cfg.builder.CFGTranslationPhaseThree;
+import org.checkerframework.nullaway.dataflow.cfg.builder.CFGTranslationPhaseTwo;
+import org.checkerframework.nullaway.dataflow.cfg.builder.ConditionalJump;
+import org.checkerframework.nullaway.dataflow.cfg.builder.ExtendedNode;
+import org.checkerframework.nullaway.dataflow.cfg.builder.Label;
+import org.checkerframework.nullaway.dataflow.cfg.builder.PhaseOneResult;
+import org.checkerframework.nullaway.dataflow.cfg.node.IntegerLiteralNode;
+import org.checkerframework.nullaway.dataflow.cfg.node.MethodInvocationNode;
+import org.checkerframework.nullaway.dataflow.cfg.node.Node;
+import org.checkerframework.nullaway.dataflow.cfg.node.ThrowNode;
+import org.checkerframework.nullaway.javacutil.AnnotationProvider;
+import org.checkerframework.nullaway.javacutil.BasicAnnotationProvider;
+import org.checkerframework.nullaway.javacutil.trees.TreeBuilder;
+import org.jspecify.annotations.Nullable;
+
+/**
+ * A NullAway specific CFGBuilder subclass, which allows to more directly control the AST to CFG
+ * translation performed by the checker framework.
+ *
+ * <p>This holds the static method {@link #build(TreePath, UnderlyingAST, boolean, boolean,
+ * ProcessingEnvironment, Handler, GenericsChecks)}, called to perform the CFG translation, and the
+ * class {@link NullAwayCFGTranslationPhaseOne}, which extends {@link CFGTranslationPhaseOne} and
+ * adds hooks for the NullAway handlers mechanism and some utility methods.
+ */
+public final class NullAwayCFGBuilder extends CFGBuilder {
+
+  /** This class should never be instantiated. */
+  private NullAwayCFGBuilder() {}
+
+  /**
+   * This static method produces a new CFG representation given a method's (or lambda/initializer)
+   * body.
+   *
+   * <p>It is analogous to {@link CFGBuilder#build(TreePath, UnderlyingAST, boolean, boolean,
+   * ProcessingEnvironment)}, but it also takes a handler to be called at specific extention points
+   * during the CFG translation.
+   *
+   * @param bodyPath the TreePath to the body of the method, lambda, or initializer.
+   * @param underlyingAST the AST that underlies the control frow graph
+   * @param assumeAssertionsEnabled can assertions be assumed to be disabled?
+   * @param assumeAssertionsDisabled can assertions be assumed to be enabled?
+   * @param env annotation processing environment containing type utilities
+   * @param handler a NullAway handler or chain of handlers (through {@link
+   *     com.uber.nullaway.handlers.CompositeHandler}
+   * @param genericsChecks checker in which to record var declaration paths, or {@code null} outside
+   *     JSpecify mode
+   * @return a control flow graph
+   */
+  public static ControlFlowGraph build(
+      TreePath bodyPath,
+      UnderlyingAST underlyingAST,
+      boolean assumeAssertionsEnabled,
+      boolean assumeAssertionsDisabled,
+      ProcessingEnvironment env,
+      Handler handler,
+      @Nullable GenericsChecks genericsChecks) {
+    TreeBuilder builder = new TreeBuilder(env);
+    AnnotationProvider annotationProvider = new BasicAnnotationProvider();
+    CFGTranslationPhaseOne phase1translator =
+        new NullAwayCFGTranslationPhaseOne(
+            builder,
+            annotationProvider,
+            assumeAssertionsEnabled,
+            assumeAssertionsDisabled,
+            env,
+            handler,
+            genericsChecks);
+    PhaseOneResult phase1result = phase1translator.process(bodyPath, underlyingAST);
+    ControlFlowGraph phase2result = CFGTranslationPhaseTwo.process(phase1result);
+    ControlFlowGraph phase3result = CFGTranslationPhaseThree.process(phase2result);
+    return phase3result;
+  }
+
+  /**
+   * A NullAway specific subclass of the Checker Framework's {@link CFGTranslationPhaseOne},
+   * augmented with handler extension points and some utility methods meant to be called from
+   * handlers to customize the AST to CFG translation.
+   */
+  public static class NullAwayCFGTranslationPhaseOne extends CFGTranslationPhaseOne {
+
+    private final Handler handler;
+
+    private final @Nullable GenericsChecks genericsChecks;
+
+    /**
+     * Create a new NullAway phase one translation visitor.
+     *
+     * @param builder a TreeBuilder object (used to create synthetic AST nodes to feed to the
+     *     translation process)
+     * @param annotationProvider an {@link AnnotationProvider}.
+     * @param assumeAssertionsEnabled can assertions be assumed to be disabled?
+     * @param assumeAssertionsDisabled can assertions be assumed to be enabled?
+     * @param env annotation processing environment containing type utilities
+     * @param handler a NullAway handler or chain of handlers (through {@link
+     *     com.uber.nullaway.handlers.CompositeHandler}
+     * @param genericsChecks checker in which to record var declaration paths, or {@code null}
+     *     outside JSpecify mode
+     */
+    public NullAwayCFGTranslationPhaseOne(
+        TreeBuilder builder,
+        AnnotationProvider annotationProvider,
+        boolean assumeAssertionsEnabled,
+        boolean assumeAssertionsDisabled,
+        ProcessingEnvironment env,
+        Handler handler,
+        @Nullable GenericsChecks genericsChecks) {
+      super(builder, annotationProvider, assumeAssertionsEnabled, assumeAssertionsDisabled, env);
+      this.handler = handler;
+      this.genericsChecks = genericsChecks;
+    }
+
+    /** Records var declaration paths during the existing CFG traversal, before dataflow runs. */
+    @Override
+    public Node visitVariable(VariableTree tree, @Nullable Void p) {
+      if (genericsChecks != null) {
+        genericsChecks.registerVarLocalDeclaration(getCurrentPath());
+      }
+      return super.visitVariable(tree, null);
+    }
+
+    /** Records enhanced-for variables, which the CFG translator does not visit as declarations. */
+    @Override
+    public Node visitEnhancedForLoop(EnhancedForLoopTree tree, @Nullable Void p) {
+      if (genericsChecks != null) {
+        genericsChecks.registerVarLocalDeclaration(
+            new TreePath(getCurrentPath(), tree.getVariable()));
+      }
+      return super.visitEnhancedForLoop(tree, null);
+    }
+
+    /**
+     * Computes binary numeric promotion after erasing operand types so that wrapper-bounded type
+     * variables can be unboxed.
+     *
+     * <p>Javac's {@code Types.unboxedType} API only accepts wrapper classes, such as {@code
+     * Integer} and {@code Long}, not type variables. For example, it rejects {@code T} when {@code
+     * T extends Integer}, but erasing {@code T} produces {@code Integer}, which the API can unbox
+     * to {@code int}. Erasure also handles chained type-variable bounds and intersection bounds.
+     *
+     * <p>TODO: Remove this override once we use a Checker Framework version with the fix for
+     * https://github.com/typetools/checker-framework/issues/8328.
+     */
+    @Override
+    protected TypeMirror binaryPromotedType(TypeMirror left, TypeMirror right) {
+      return super.binaryPromotedType(types.erasure(left), types.erasure(right));
+    }
+
+    /**
+     * Obtain the type mirror for a given class, used for exception throwing.
+     *
+     * <p>We use this method to expose the otherwise protected method {@link #getTypeMirror(Class)}
+     * to handlers.
+     *
+     * @param klass a Java class
+     * @return the corresponding type mirror
+     */
+    public TypeMirror classToErrorType(Class<?> klass) {
+      return this.getTypeMirror(klass);
+    }
+
+    /**
+     * Extend the CFG to throw an exception if the passed expression node evaluates to {@code
+     * false}.
+     *
+     * @param booleanExpressionNode a CFG Node representing a boolean expression.
+     * @param errorType the type of the exception to throw if booleanExpressionNode evaluates to
+     *     {@code false}.
+     */
+    public void insertThrowOnFalse(Node booleanExpressionNode, TypeMirror errorType) {
+      insertThrowOn(false, booleanExpressionNode, errorType);
+    }
+
+    /**
+     * Extend the CFG to throw an exception if the passed expression node evaluates to {@code true}.
+     *
+     * @param booleanExpressionNode a CFG Node representing a boolean expression.
+     * @param errorType the type of the exception to throw if booleanExpressionNode evaluates to
+     *     {@code true}.
+     */
+    public void insertThrowOnTrue(Node booleanExpressionNode, TypeMirror errorType) {
+      insertThrowOn(true, booleanExpressionNode, errorType);
+    }
+
+    /**
+     * Extend the CFG to throw an exception unconditionally.
+     *
+     * @param errorType the type of the exception to throw.
+     */
+    public void insertUnconditionalThrow(TypeMirror errorType) {
+      // the value that gets thrown does not matter; we just throw 0
+      LiteralTree dummyValueToThrowTree = treeBuilder.buildLiteral(0);
+      handleArtificialTree(dummyValueToThrowTree);
+      Node dummyValueToThrowNode = new IntegerLiteralNode(dummyValueToThrowTree);
+      insertThrow(dummyValueToThrowNode, dummyValueToThrowTree, errorType);
+    }
+
+    private void insertThrowOn(boolean throwOn, Node booleanExpressionNode, TypeMirror errorType) {
+      Tree tree = booleanExpressionNode.getTree();
+      Preconditions.checkArgument(
+          tree instanceof ExpressionTree,
+          "Argument booleanExpressionNode must represent a boolean expression");
+      ExpressionTree booleanExpressionTree = (ExpressionTree) booleanExpressionNode.getTree();
+      Preconditions.checkNotNull(booleanExpressionTree);
+      Label preconditionEntry = new Label();
+      Label endPrecondition = new Label();
+      this.scan(booleanExpressionTree, (Void) null);
+      ConditionalJump cjump =
+          new ConditionalJump(
+              throwOn ? preconditionEntry : endPrecondition,
+              throwOn ? endPrecondition : preconditionEntry);
+      this.extendWithExtendedNode(cjump);
+      this.addLabelForNextNode(preconditionEntry);
+      insertThrow(booleanExpressionNode, booleanExpressionTree, errorType);
+      this.addLabelForNextNode(endPrecondition);
+    }
+
+    /**
+     * Extend the CFG to throw an exception with the given type, using the given expression tree as
+     * the thrown expression.
+     *
+     * @param thrownExpressionNode node representing the expression to throw
+     * @param thrownExpressionTree tree representing the expression to throw
+     * @param errorType the type of the exception to throw
+     */
+    private void insertThrow(
+        Node thrownExpressionNode, ExpressionTree thrownExpressionTree, TypeMirror errorType) {
+      ExtendedNode exNode =
+          this.extendWithNodeWithException(
+              new ThrowNode(
+                  new ThrowTree() {
+                    // Dummy throw tree, unused. We could use null here, but that violates nullness
+                    // typing.
+                    @Override
+                    public ExpressionTree getExpression() {
+                      return thrownExpressionTree;
+                    }
+
+                    @Override
+                    public Kind getKind() {
+                      return Kind.THROW;
+                    }
+
+                    @Override
+                    public <R, D> R accept(TreeVisitor<R, D> visitor, D data) {
+                      return visitor.visitThrow(this, data);
+                    }
+                  },
+                  thrownExpressionNode,
+                  this.env.getTypeUtils()),
+              errorType);
+      exNode.setTerminatesExecution(true);
+    }
+
+    @Override
+    public MethodInvocationNode visitMethodInvocation(MethodInvocationTree tree, @Nullable Void p) {
+      MethodInvocationNode originalNode = super.visitMethodInvocation(tree, null);
+      return handler.onCFGBuildPhase1AfterVisitMethodInvocation(this, tree, originalNode);
+    }
+  }
+}

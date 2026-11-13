@@ -15,6 +15,7 @@
  */
 
 import net.ltgt.gradle.errorprone.CheckSeverity
+
 buildscript {
     repositories {
         mavenCentral()
@@ -22,53 +23,132 @@ buildscript {
     }
 
     dependencies {
-        classpath 'com.android.tools.build:gradle:4.1.1'
-        classpath 'com.vanniktech:gradle-maven-publish-plugin:0.14.2'
+        classpath libs.android.gradle.plugin
+        classpath libs.gradle.maven.publish.plugin
     }
 }
+
 plugins {
-  id "com.github.sherter.google-java-format" version "0.9"
-  id "net.ltgt.errorprone" version "2.0.1" apply false
-  id "com.github.johnrengelman.shadow" version "6.1.0" apply false
-  id "com.github.nbaztec.coveralls-jacoco" version "1.2.5" apply false
-  id "com.android.application" version "3.5.0" apply false
+    alias(libs.plugins.spotless)
+    alias(libs.plugins.errorprone) apply false
+    alias(libs.plugins.shadow) apply false
+    alias(libs.plugins.jmh) apply false
+    alias(libs.plugins.shellcheck)
 }
+
+ext {
+    oldestErrorProneVersion = libs.versions.errorProneOldest.get()
+    errorProneJdk17Version = libs.versions.errorProneJdk17.get()
+}
+
+
 
 repositories {
-  // to get the google-java-format jar and dependencies
-  mavenCentral()
+    // to get the google-java-format jar and dependencies
+    mavenCentral()
 }
 
-apply from: "gradle/dependencies.gradle"
+def currentJavaVersion = JavaVersion.current()
+if (!currentJavaVersion.isCompatibleWith(JavaVersion.VERSION_21)) {
+    throw new GradleException(
+    "NullAway only builds on JDK 21 or higher now. Detected ${System.getProperty('java.version')}. Please upgrade to JDK 21 or later."
+    )
+}
+
+if (currentJavaVersion == JavaVersion.VERSION_21) {
+    def runtimeVersion = Runtime.version()
+    if (runtimeVersion.feature() == 21 && runtimeVersion.update() < 8) {
+        throw new GradleException(
+        "Building NullAway on JDK 21 requires at least 21.0.8, but found ${runtimeVersion}.  Please upgrade to 21.0.8 or later, or to the most recent JDK release."
+        )
+    }
+}
 
 subprojects { project ->
     project.apply plugin: "net.ltgt.errorprone"
     project.dependencies {
-        errorprone deps.build.errorProneCore
-        errorproneJavac deps.build.errorProneJavac
+        errorprone libs.error.prone.core
     }
     project.tasks.withType(JavaCompile) {
         dependsOn(installGitHooks)
+        // Always compile using the latest JDK we can
+        javaCompiler = javaToolchains.compilerFor {
+            languageVersion = JavaLanguageVersion.of(27)
+        }
         options.compilerArgs += [
             "-Xlint:deprecation",
             "-Xlint:rawtypes",
             "-Xlint:unchecked",
-            "-Werror"
+            "-Werror",
+            "-parameters",
         ]
         options.errorprone {
-            // disable warnings in generated code; AutoValue code fails UnnecessaryParentheses check
-            disableWarningsInGeneratedCode = true
-            // Triggers for generated Android code (R.java)
-            check("MutablePublicArray", CheckSeverity.OFF)
+
+            // https://github.com/uber/NullAway/issues/1398
+            check("MisformattedTestData", CheckSeverity.OFF)
+
             // this check is too noisy
             check("StringSplitter", CheckSeverity.OFF)
+            // https://github.com/google/error-prone/issues/3366
+            check("CanIgnoreReturnValueSuggester", CheckSeverity.OFF)
+            // turn up various checks
             check("WildcardImport", CheckSeverity.ERROR)
+            check("MissingBraces", CheckSeverity.ERROR)
+            check("TypeToString", CheckSeverity.ERROR)
+            check("SymbolToString", CheckSeverity.ERROR)
+            check("MultipleTopLevelClasses", CheckSeverity.ERROR)
+            check("ClassName", CheckSeverity.ERROR)
+            check("PackageLocation", CheckSeverity.ERROR)
+            check("UnnecessaryAnonymousClass", CheckSeverity.ERROR)
+            check("UnusedException", CheckSeverity.ERROR)
+            check("UnnecessaryFinal", CheckSeverity.ERROR)
+            check("PreferredInterfaceType", CheckSeverity.ERROR)
+            check("AnnotationPosition", CheckSeverity.ERROR)
+            check("VoidMissingNullable", CheckSeverity.ERROR)
+            check("EqualsMissingNullable", CheckSeverity.ERROR)
+            // To enable auto-patching, uncomment the line below, replace [CheckerName] with
+            // the checker(s) you want to apply patches for (comma-separated), and above, disable
+            // "-Werror"
+            // errorproneArgs.addAll("-XepPatchChecks:[CheckerName]", "-XepPatchLocation:IN_PLACE")
         }
     }
 
-    if (JavaVersion.current().java9Compatible) {
-        tasks.withType(JavaCompile) {
-            options.compilerArgs += [ "--release", "8" ]
+    // We need to use the older sourceCompatibility / targetCompatibility settings, rather than the newer "release"
+    // option, since we use internal javac APIs, which "release" doesn't allow
+    tasks.withType(JavaCompile) {
+        java.sourceCompatibility = JavaVersion.VERSION_17
+        java.targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    // Javadoc runs in a separate process, so it does not inherit --add-exports options from JavaCompile.
+    // These exports are needed when documented APIs refer to javac internals.
+    tasks.withType(Javadoc).configureEach {
+        // Many subprojects contain intentionally minimal test fixtures and samples. Keep doclint
+        // enabled for malformed documentation, but do not require API documentation for every
+        // public fixture member.
+        options.addBooleanOption("Xdoclint:all,-missing", true)
+        options.addMultilineStringsOption("-add-exports").setValue([
+            "jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED",
+            "jdk.compiler/com.sun.tools.javac.processing=ALL-UNNAMED",
+            "jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED",
+            "jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED",
+        ])
+    }
+
+    tasks.withType(Test).configureEach {
+        maxParallelForks = Runtime.runtime.availableProcessors().intdiv(2) ?: 1
+        // A failed test has to be diagnosable from the console alone: CI runs `./gradlew build`
+        // and publishes no test report, so the log is all a reader gets.  Gradle's default logging
+        // names the exception class and the line of the test method and drops the message, which
+        // for a NullAway compilation test throws away the entire diagnosis.
+        testLogging {
+            exceptionFormat = 'full'
+            // The top-level settings above configure the lifecycle log level only, so a run under
+            // --quiet, as agents make, would otherwise report a failure count and nothing else.
+            quiet {
+                events 'failed'
+                exceptionFormat = 'full'
+            }
         }
     }
 
@@ -77,10 +157,42 @@ subprojects { project ->
         google()
     }
 
+    // Spotless complains when applied to the folders containing projects
+    // when they do not have a build.gradle file
+    if (project.name != "jar-infer" && project.name != "library-model" && project.name != "jdk-annotations" && project.name != "nullaway-bom" && project.name != "code-coverage-report") {
+        project.apply plugin: "com.diffplug.spotless"
+        spotless {
+            java {
+                googleJavaFormat(libs.versions.google.java.format.get())
+            }
+        }
+    }
 }
 
-googleJavaFormat {
-  toolVersion = "1.6"
+spotless {
+    predeclareDeps()
+    groovyGradle {
+        target '**/*.gradle'
+        greclipse()
+        leadingTabsToSpaces(4)
+        trimTrailingWhitespace()
+        endWithNewline()
+    }
+}
+spotlessPredeclare {
+    java { googleJavaFormat(libs.versions.google.java.format.get()) }
+    groovyGradle {
+        greclipse()
+    }
+}
+
+shellcheck {
+    useDocker = false
+    shellcheckBinary = "shellcheck"
+    sourceFiles =
+            fileTree(".") {
+                include("**/*.sh")
+            }
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -88,10 +200,24 @@ googleJavaFormat {
 //  Google Java Format pre-commit hook installation
 //
 
+// The hook goes into `.git/hooks`, which exists only where `.git` is a directory.  A linked worktree
+// has a `.git` file naming that worktree's git directory instead, and a source archive has no
+// `.git` at all; a `Copy` task pointed at either one fails validation.  A worktree loses no hook by
+// being skipped, since git runs the hooks of the shared repository that the main checkout installs
+// into.
+def dotGitDir = file('.git')
+def gitHooksDir = dotGitDir.isDirectory() ? new File(dotGitDir, 'hooks') : null
+
 tasks.register('installGitHooks', Copy) {
-	from(file('config/hooks/pre-commit-stub')) {
-		rename 'pre-commit-stub', 'pre-commit'
-	}
-	into file('.git/hooks')
-	fileMode 0777
+    from(file('config/hooks/pre-commit-stub')) {
+        rename 'pre-commit-stub', 'pre-commit'
+    }
+    if (gitHooksDir == null) {
+        enabled = false
+    } else {
+        into gitHooksDir
+    }
+    filePermissions {
+        unix(0777)
+    }
 }

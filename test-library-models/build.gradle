@@ -17,25 +17,30 @@
 import net.ltgt.gradle.errorprone.CheckSeverity
 
 plugins {
-  id "java-library"
+    id "java-library"
+    id 'nullaway.java-test-conventions'
 }
 
-sourceCompatibility = "1.8"
-targetCompatibility = "1.8"
-
 dependencies {
-    compileOnly deps.apt.autoService
-    annotationProcessor deps.apt.autoService
+    compileOnly libs.auto.service
+    annotationProcessor libs.auto.service
     compileOnly project(":nullaway")
     annotationProcessor project(":nullaway")
-    compileOnly deps.build.guava
+    compileOnly libs.guava
+
+    testImplementation libs.junit4
+    testImplementation(libs.error.prone.test.helpers) {
+        exclude group: "junit", module: "junit"
+    }
+    testImplementation project(":nullaway")
+    testImplementation project(":test-java-lib")
 }
 
 tasks.withType(JavaCompile) {
-  if (!name.toLowerCase().contains("test")) {
-    options.errorprone {
-      check("NullAway", CheckSeverity.ERROR)
-      option("NullAway:AnnotatedPackages", "com.uber")
+    if (!name.toLowerCase().contains("test")) {
+        options.errorprone {
+            check("NullAway", CheckSeverity.ERROR)
+            option("NullAway:AnnotatedPackages", "com.uber")
+        }
     }
-  }
 }

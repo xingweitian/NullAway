@@ -1,0 +1,80 @@
+# This GitHub Actions workflow runs JMH benchmarks when requested
+name: Run JMH Benchmarks for Pull Request
+
+on:
+  pull_request: # Trigger when a label is added.  Only contributors have permissions to add labels
+    types: [labeled]
+
+# Only allow one instance of JMH benchmarking to be running at any given time
+concurrency: all
+
+jobs:
+  benchmarking:
+    # Only run this job if the label is 'run-benchmarks' and the PR in on the uber/NullAway repository
+    if: github.event.label.name == 'run-benchmarks' && github.repository == 'uber/NullAway'
+    runs-on: ubuntu-latest 
+    permissions:
+      contents: read
+      pull-requests: write # Required to read PR details and publish the benchmark result.
+
+    steps:
+
+    - name: Checkout repository 
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Get pull request details
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        PR_NUMBER: ${{ github.event.number }}
+        REPO_NAME: ${{ github.repository }}
+      run: |
+        bash ./.github/workflows/get_repo_details.sh "$GH_TOKEN" "$PR_NUMBER" "$REPO_NAME"
+
+    - id: 'auth'
+      name: Authenticating 
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+      with:
+        credentials_json: '${{ secrets.GCP_SA_KEY_1 }}' 
+
+    - name: Set up Google Cloud SDK 
+      uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+      
+    - name: Start VM
+      run: gcloud compute instances start nullway-jmh --zone=us-central1-a
+      
+    - name: Run benchmarks 
+      run: |
+        bash ./.github/workflows/run_gcp_benchmarks.sh
+        
+    - name: Cleanup
+      # Delete the run directory on the Google Cloud instance
+      if: always()
+      run: |
+        bash ./.github/workflows/run_gcp_benchmarks.sh --cleanup
+
+    - name: Formatting Benchmark # Create a text file containing the benchmark results
+      run:  |
+        (echo 'Main Branch:'; echo '```' ; cat main_text.txt; echo '```'; echo 'With This PR:'; echo '```' ; cat pr_text.txt; echo '```') > benchmark.txt
+   
+    - name: Comment Benchmark
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      if: always()
+      with:
+        script: |
+          const fs = require('fs');
+          const path = 'benchmark.txt';
+          const output = fs.readFileSync(path, 'utf8');
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: output
+            });
+
+    - name: Stop VM
+      if: always()
+      run: gcloud compute instances stop nullway-jmh --zone=us-central1-a
+
+      

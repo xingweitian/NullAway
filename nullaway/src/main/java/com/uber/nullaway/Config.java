@@ -24,21 +24,57 @@ package com.uber.nullaway;
 
 import com.google.common.collect.ImmutableSet;
 import com.sun.tools.javac.code.Symbol;
+import com.uber.nullaway.fixserialization.FixSerializationConfig;
 import java.util.Set;
-import javax.annotation.Nullable;
+import org.jspecify.annotations.Nullable;
 
 /** Provides configuration parameters for the nullability checker. */
 public interface Config {
 
   /**
-   * Checks if a symbol comes from an annotated package.
+   * Checks if Serialization feature is active.
    *
-   * @param symbol symbol for class
-   * @return true if the class is from a package that should be treated as properly annotated
-   *     according to our convention (every possibly null parameter / return / field
-   *     annotated @Nullable), false otherwise
+   * @return true, if Fix Serialization feature is active.
    */
-  boolean fromAnnotatedPackage(Symbol.ClassSymbol symbol);
+  boolean serializationIsActive();
+
+  /**
+   * Getter method for {@link FixSerializationConfig}.
+   *
+   * <p>Fix Serialization feature must be activated, otherwise calling this method will fail the
+   * execution.
+   *
+   * @return {@link FixSerializationConfig} instance in Config.
+   */
+  FixSerializationConfig getSerializationConfig();
+
+  /**
+   * Checks if a class comes from an explicitly annotated package.
+   *
+   * @param className fully qualified name for class
+   * @return true if the class is from a package that is explicitly configured to be treated as
+   *     properly annotated according to our convention (every possibly null parameter / return /
+   *     field annotated @Nullable), false otherwise
+   */
+  boolean fromExplicitlyAnnotatedPackage(String className);
+
+  /**
+   * Checks if a class comes from an explicitly unannotated (sub-)package.
+   *
+   * @param className fully qualified name for class
+   * @return true if the class is from a package that is explicitly configured to be treated as
+   *     unannotated (even if it is a subpackage of a package configured to be explicitly annotated
+   *     or if it's marked @NullMarked), false otherwise
+   */
+  boolean fromExplicitlyUnannotatedPackage(String className);
+
+  /**
+   * Checks if (tool) generated code should be considered always unannoatated.
+   *
+   * @return true if code marked as generated code should be treated as unannotated, even if it
+   *     comes from a package otherwise configured as annotated.
+   */
+  boolean treatGeneratedAsUnannotated();
 
   /**
    * Checks if a class should be excluded.
@@ -65,6 +101,8 @@ public interface Config {
    */
   ImmutableSet<String> getExcludedClassAnnotations();
 
+  ImmutableSet<String> getGeneratedCodeAnnotations();
+
   /**
    * Checks if the annotation is an @Initializer annotation.
    *
@@ -73,6 +111,22 @@ public interface Config {
    *     otherwise.
    */
   boolean isInitializerMethodAnnotation(String annotationName);
+
+  /**
+   * Checks if the annotation is a custom @Nullable annotation.
+   *
+   * @param annotationName fully-qualified annotation name
+   * @return true if annotation should be considered as a custom nullable annotation.
+   */
+  boolean isCustomNullableAnnotation(String annotationName);
+
+  /**
+   * Checks if the annotation is a custom @Nonnull annotation.
+   *
+   * @param annotationName fully-qualified annotation name
+   * @return true if annotation should be considered as a custom nonnull annotation.
+   */
+  boolean isCustomNonnullAnnotation(String annotationName);
 
   /**
    * Checks if the annotation is an excluded field annotation.
@@ -102,6 +156,9 @@ public interface Config {
   /**
    * Checks if annotation marks an "external-init class," i.e., a class where some external
    * framework initializes object fields after invoking the zero-argument constructor.
+   *
+   * <p>Note that this annotation can be on the class itself, or on the zero-arguments constructor,
+   * but will be ignored anywhere else.
    *
    * @param annotationName fully-qualified annotation name
    * @return true if classes with the annotation are external-init
@@ -181,8 +238,14 @@ public interface Config {
    *     return an @NonNull copy (likely through an unsafe downcast, but performing runtime checking
    *     and logging)
    */
-  @Nullable
-  String getCastToNonNullMethod();
+  @Nullable String getCastToNonNullMethod();
+
+  /**
+   * Gets the suppression name aliases.
+   *
+   * @return the name aliases that should be honored as part of a @SuppressWarnings annotation.
+   */
+  Set<String> getSuppressionNameAliases();
 
   /**
    * Gets an optional comment to add to auto-fix suppressions.
@@ -191,6 +254,28 @@ public interface Config {
    *     and/or auto-fix runs.
    */
   String getAutofixSuppressionComment();
+
+  /**
+   * Checks if the given library model should be skipped/ignored.
+   *
+   * <p>For ease of configuration in the command line, this works at the level of the (class, method
+   * name) pair, meaning it applies for all methods with the same name in the same class, even if
+   * they have different signatures, and to all library models applicable to that method (i.e. on
+   * the method's return, arguments, etc).
+   *
+   * @param classDotMethod The method from the model, in [fully_qualified_class_name].[method_name]
+   *     format (no args)
+   * @return True if the library model should be skipped.
+   */
+  boolean isSkippedLibraryModel(String classDotMethod);
+
+  /**
+   * Gets the set of classes that should be treated as equivalent to a Guava fluent futures class.
+   * The option has no effect in JSpecify mode.
+   *
+   * @see com.uber.nullaway.handlers.temporary.FluentFutureHandler
+   */
+  Set<String> getExtraFuturesClasses();
 
   // --- JarInfer configs ---
 
@@ -202,26 +287,11 @@ public interface Config {
   boolean isJarInferEnabled();
 
   /**
-   * Checks if NullAway should use @Nullable return value annotations inferred by JarInfer.
+   * Checks if <a href="https://github.com/jspecify/jdk">JSpecify JDK models</a> should be enabled.
    *
-   * @return true if NullAway should use the @Nullable return value annotations inferred by
-   *     JarInfer.
+   * @return true if JSpecify JDK models should be enabled, false otherwise
    */
-  boolean isJarInferUseReturnAnnotations();
-
-  /**
-   * Used by JarInfer
-   *
-   * @return the regex to extract jar name from the JarInfer model jar's path.
-   */
-  String getJarInferRegexStripModelJarName();
-
-  /**
-   * Used by JarInfer.
-   *
-   * @return the regex to extract jar name from the classfile jar's path.
-   */
-  String getJarInferRegexStripCodeJarName();
+  boolean isJSpecifyJDKModels();
 
   /**
    * Gets the URL to show with NullAway error messages.
@@ -231,13 +301,6 @@ public interface Config {
   String getErrorURL();
 
   /**
-   * Checks whether (tool-)generated code should be treated as unannotated.
-   *
-   * @return true if generated code should be treated as unannotated
-   */
-  boolean treatGeneratedAsUnannotated();
-
-  /**
    * Checks if acknowledging {@code @RecentlyNullable} and {@code @RecentlyNonNull} annotations is
    * enabled.
    *
@@ -245,4 +308,26 @@ public interface Config {
    *     similarly for {@code @RecentlyNonNull}
    */
   boolean acknowledgeAndroidRecent();
+
+  /** Should new checks based on JSpecify (like checks for generic types) be enabled? */
+  boolean isJSpecifyMode();
+
+  /** Should PolyNull library models be enabled? */
+  boolean isPolyNullLibraryModelsEnabled();
+
+  /**
+   * Should wildcard-aware generic nullability checks be enabled? These also compute {@link
+   * Nullness#NO_CHANGE} for the values listed there, such as the result of {@code Box<? extends
+   * T>.get()} or an enhanced-for element of type {@code T}; with the option off, such a value is
+   * {@link Nullness#NONNULL}.
+   */
+  boolean handleWildcardGenerics();
+
+  /**
+   * Checks if a warning should be issued when generic type inference fails to infer a type
+   * argument's nullability.
+   *
+   * @return true if a warning should be issued when generic type inference fails
+   */
+  boolean warnOnGenericInferenceFailure();
 }

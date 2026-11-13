@@ -22,38 +22,60 @@
 
 package com.uber.nullaway;
 
+import static com.sun.source.tree.Tree.Kind.OTHER;
+
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableSet;
+import com.google.errorprone.VisitorState;
+import com.google.errorprone.suppliers.Supplier;
+import com.google.errorprone.suppliers.Suppliers;
 import com.google.errorprone.util.ASTHelpers;
+import com.sun.source.tree.ArrayAccessTree;
 import com.sun.source.tree.BlockTree;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.LambdaExpressionTree;
 import com.sun.source.tree.MemberReferenceTree;
 import com.sun.source.tree.MethodTree;
+import com.sun.source.tree.ParenthesizedTree;
 import com.sun.source.tree.Tree;
+import com.sun.source.tree.TypeCastTree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePath;
 import com.sun.tools.javac.code.Attribute;
+import com.sun.tools.javac.code.Flags;
 import com.sun.tools.javac.code.Symbol;
 import com.sun.tools.javac.code.TargetType;
 import com.sun.tools.javac.code.Type;
+import com.sun.tools.javac.code.TypeAnnotationPosition;
+import com.sun.tools.javac.code.TypeAnnotationPosition.TypePathEntry;
+import com.sun.tools.javac.code.TypeTag;
 import com.sun.tools.javac.code.Types;
 import com.sun.tools.javac.tree.JCTree;
 import com.sun.tools.javac.util.JCDiagnostic;
+import com.uber.nullaway.handlers.Handler;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.BiPredicate;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
-import javax.annotation.Nullable;
 import javax.lang.model.element.AnnotationMirror;
 import javax.lang.model.element.AnnotationValue;
+import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
+import javax.lang.model.type.TypeKind;
 import org.checkerframework.nullaway.javacutil.AnnotationUtils;
+import org.jspecify.annotations.Nullable;
 
 /** Helpful utility methods for nullability analysis. */
 public class NullabilityUtil {
+  public static final String NULLMARKED_SIMPLE_NAME = "NullMarked";
+  public static final String NULLUNMARKED_SIMPLE_NAME = "NullUnmarked";
+
+  private static final Supplier<Type> MAP_TYPE_SUPPLIER = Suppliers.typeFromString("java.util.Map");
+  private static final String JETBRAINS_NOT_NULL = "org.jetbrains.annotations.NotNull";
 
   private NullabilityUtil() {}
 
@@ -93,8 +115,7 @@ public class NullabilityUtil {
    * @return closest overridden ancestor method, or <code>null</code> if method does not override
    *     anything
    */
-  @Nullable
-  public static Symbol.MethodSymbol getClosestOverriddenMethod(
+  public static Symbol.@Nullable MethodSymbol getClosestOverriddenMethod(
       Symbol.MethodSymbol method, Types types) {
     // taken from Error Prone MethodOverrides check
     Symbol.ClassSymbol owner = method.enclClass();
@@ -103,10 +124,9 @@ public class NullabilityUtil {
         continue;
       }
       for (Symbol m : s.tsym.members().getSymbolsByName(method.name)) {
-        if (!(m instanceof Symbol.MethodSymbol)) {
+        if (!(m instanceof Symbol.MethodSymbol msym)) {
           continue;
         }
-        Symbol.MethodSymbol msym = (Symbol.MethodSymbol) m;
         if (msym.isStatic()) {
           continue;
         }
@@ -117,27 +137,6 @@ public class NullabilityUtil {
     }
     return null;
   }
-  /**
-   * finds the symbol for the top-level class containing the given symbol
-   *
-   * @param symbol the given symbol
-   * @return symbol for the non-nested enclosing class
-   */
-  public static Symbol.ClassSymbol getOutermostClassSymbol(Symbol symbol) {
-    // get the symbol for the outermost enclosing class.  this handles
-    // the case of anonymous classes
-    Symbol.ClassSymbol outermostClassSymbol = ASTHelpers.enclosingClass(symbol);
-    while (outermostClassSymbol.getNestingKind().isNested()) {
-      Symbol.ClassSymbol enclosingSymbol = ASTHelpers.enclosingClass(outermostClassSymbol.owner);
-      if (enclosingSymbol != null) {
-        outermostClassSymbol = enclosingSymbol;
-      } else {
-        // enclosingSymbol can be null in weird cases like for array methods
-        break;
-      }
-    }
-    return outermostClassSymbol;
-  }
 
   /**
    * find the enclosing method, lambda expression or initializer block for the leaf of some tree
@@ -147,8 +146,7 @@ public class NullabilityUtil {
    * @param others also stop and return in case of any of these tree kinds
    * @return the closest enclosing method / lambda
    */
-  @Nullable
-  public static TreePath findEnclosingMethodOrLambdaOrInitializer(
+  public static @Nullable TreePath findEnclosingMethodOrLambdaOrInitializer(
       TreePath path, ImmutableSet<Tree.Kind> others) {
     TreePath curPath = path.getParentPath();
     while (curPath != null) {
@@ -181,8 +179,7 @@ public class NullabilityUtil {
    * @param path the tree path
    * @return the closest enclosing method / lambda
    */
-  @Nullable
-  public static TreePath findEnclosingMethodOrLambdaOrInitializer(TreePath path) {
+  public static @Nullable TreePath findEnclosingMethodOrLambdaOrInitializer(TreePath path) {
     return findEnclosingMethodOrLambdaOrInitializer(path, ImmutableSet.of());
   }
 
@@ -200,6 +197,78 @@ public class NullabilityUtil {
   }
 
   /**
+   * Gets declaration and root type-use annotations written on a lambda parameter. Read the raw
+   * attributes from the parameter itself, since javac does not put them on the synthetic method
+   * owning a lambda in an initializer block. Avoid the parameter's type, which can carry
+   * annotations inferred by javac rather than written on the parameter.
+   *
+   * @param symbol the lambda parameter symbol
+   * @return the annotations explicitly written on the parameter's declaration or root type
+   */
+  public static Stream<? extends AnnotationMirror> getExplicitLambdaParameterAnnotations(
+      Symbol.VarSymbol symbol) {
+    return Stream.concat(
+        symbol.getAnnotationMirrors().stream(),
+        symbol.getRawTypeAttributes().stream().filter(t -> isDirectTypeUseAnnotation(t, symbol)));
+  }
+
+  /**
+   * Check if any direct annotation a symbol matches a given predicate. Includes code for backward
+   * compatibility with older JDKs where javac did not place type-use annotations on Symbols from
+   * bytecodes.
+   *
+   * @param symbol the symbol
+   * @param predicate the predicate to match annotation names against
+   * @return true if any annotation on the symbol matches the predicate, false otherwise
+   */
+  public static boolean hasAnyAnnotationMatchingBackCompat(
+      Symbol symbol, Predicate<String> predicate) {
+    if (hasAnyAnnotationMatching(symbol, predicate)) {
+      return true;
+    }
+    // to handle bytecodes, also check direct type-use annotations stored in attributes
+    Symbol typeAnnotationOwner =
+        symbol.getKind().equals(ElementKind.PARAMETER) ? symbol.owner : symbol;
+    for (Attribute.TypeCompound typeCompound : typeAnnotationOwner.getRawTypeAttributes()) {
+      if (!targetTypeMatches(symbol, typeCompound.position)
+          || !isDirectTypeUseAnnotation(typeCompound, symbol)) {
+        continue;
+      }
+      if (predicate.test(typeCompound.getAnnotationType().toString())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Check if any direct annotation a symbol matches a given predicate.
+   *
+   * @param symbol the symbol
+   * @param predicate the predicate to match annotation names against
+   * @return true if any annotation on the symbol matches the predicate, false otherwise
+   */
+  public static boolean hasAnyAnnotationMatching(Symbol symbol, Predicate<String> predicate) {
+    // check for declaration annotations
+    for (AnnotationMirror annotationMirror : symbol.getAnnotationMirrors()) {
+      if (predicate.test(annotationMirror.getAnnotationType().toString())) {
+        return true;
+      }
+    }
+    // check for type use annotations.  For MethodSymbols, look on the return type
+    Type annotatedType =
+        symbol instanceof Symbol.MethodSymbol methodSymbol
+            ? methodSymbol.getReturnType()
+            : symbol.type;
+    for (AnnotationMirror annotationMirror : annotatedType.getAnnotationMirrors()) {
+      if (predicate.test(annotationMirror.getAnnotationType().toString())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Retrieve the {@code value} attribute of a method annotation of some type.
    *
    * @param methodSymbol A method to check for the annotation.
@@ -209,23 +278,8 @@ public class NullabilityUtil {
    */
   public static @Nullable String getAnnotationValue(
       Symbol.MethodSymbol methodSymbol, String annotName) {
-    AnnotationMirror annot =
-        AnnotationUtils.getAnnotationByName(methodSymbol.getAnnotationMirrors(), annotName);
-    if (annot == null) {
-      return null;
-    }
-
-    Map<? extends ExecutableElement, ? extends AnnotationValue> elementValues =
-        annot.getElementValues();
-    for (Map.Entry<? extends ExecutableElement, ? extends AnnotationValue> entry :
-        elementValues.entrySet()) {
-      ExecutableElement elem = entry.getKey();
-      if (elem.getSimpleName().contentEquals("value")) {
-        return (String) entry.getValue().getValue();
-      }
-    }
-    // not found
-    return null;
+    AnnotationMirror annot = findAnnotation((Symbol) methodSymbol, annotName, true);
+    return annot == null ? null : getAnnotationValue(annot);
   }
 
   /**
@@ -242,14 +296,7 @@ public class NullabilityUtil {
    */
   public static @Nullable Set<String> getAnnotationValueArray(
       Symbol.MethodSymbol methodSymbol, String annotName, boolean exactMatch) {
-    AnnotationMirror annot = null;
-    for (AnnotationMirror annotationMirror : methodSymbol.getAnnotationMirrors()) {
-      String name = AnnotationUtils.annotationName(annotationMirror);
-      if ((exactMatch && name.equals(annotName)) || (!exactMatch && name.endsWith(annotName))) {
-        annot = annotationMirror;
-        break;
-      }
-    }
+    AnnotationMirror annot = findAnnotation(methodSymbol, annotName, exactMatch);
     if (annot == null) {
       return null;
     }
@@ -268,6 +315,53 @@ public class NullabilityUtil {
   }
 
   /**
+   * Retrieve the specific annotation of a symbol.
+   *
+   * @param symbol A symbol to check for the annotation.
+   * @param annotName The qualified name or simple name of the annotation depending on the value of
+   *     {@code exactMatch}.
+   * @param exactMatch If true, the annotation name must match the full qualified name given in
+   *     {@code annotName}, otherwise, simple names will be checked.
+   * @return an {@code AnnotationMirror} representing that annotation, or null in case the
+   *     annotation with a given name {@code annotName} doesn't exist in {@code symbol}.
+   */
+  public static @Nullable AnnotationMirror findAnnotation(
+      Symbol symbol, String annotName, boolean exactMatch) {
+    AnnotationMirror annot = null;
+    for (AnnotationMirror annotationMirror : symbol.getAnnotationMirrors()) {
+      String name = AnnotationUtils.annotationName(annotationMirror);
+      if ((exactMatch && name.equals(annotName)) || (!exactMatch && name.endsWith(annotName))) {
+        annot = annotationMirror;
+        break;
+      }
+    }
+    return annot;
+  }
+
+  /**
+   * Retrieve the {@code value} attribute from an annotation mirror.
+   *
+   * @param annot the annotation mirror
+   * @return the {@code value} attribute, or {@code null} if the annotation has no string-valued
+   *     {@code value} element
+   */
+  public static @Nullable String getAnnotationValue(AnnotationMirror annot) {
+    Map<? extends ExecutableElement, ? extends AnnotationValue> elementValues =
+        annot.getElementValues();
+    for (Map.Entry<? extends ExecutableElement, ? extends AnnotationValue> entry :
+        elementValues.entrySet()) {
+      ExecutableElement elem = entry.getKey();
+      if (elem.getSimpleName().contentEquals("value")) {
+        Object value = entry.getValue().getValue();
+        if (value instanceof String string) {
+          return string;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
    * Works for method parameters defined either in source or in class files
    *
    * @param symbol the method symbol
@@ -277,24 +371,158 @@ public class NullabilityUtil {
   public static Stream<? extends AnnotationMirror> getAllAnnotationsForParameter(
       Symbol.MethodSymbol symbol, int paramInd) {
     Symbol.VarSymbol varSymbol = symbol.getParameters().get(paramInd);
-    return Stream.concat(
-        varSymbol.getAnnotationMirrors().stream(),
-        symbol
-            .getRawTypeAttributes()
-            .stream()
-            .filter(
-                t ->
-                    t.position.type.equals(TargetType.METHOD_FORMAL_PARAMETER)
-                        && t.position.parameter_index == paramInd));
+    // On modern javac versions, type-use annotations are attached directly to the parameter's
+    // type. Keep reading raw attributes as well for backward compatibility with older javac
+    // behavior.
+    Stream<? extends AnnotationMirror> typeUseAnnotations =
+        Stream.concat(
+                varSymbol.type.getAnnotationMirrors().stream(),
+                symbol.getRawTypeAttributes().stream()
+                    .filter(
+                        t ->
+                            t.position.type.equals(TargetType.METHOD_FORMAL_PARAMETER)
+                                && t.position.parameter_index == paramInd
+                                && NullabilityUtil.isDirectTypeUseAnnotation(t, symbol)))
+            .distinct();
+    return Stream.concat(varSymbol.getAnnotationMirrors().stream(), typeUseAnnotations);
   }
 
-  private static Stream<? extends AnnotationMirror> getTypeUseAnnotations(Symbol symbol) {
-    Stream<Attribute.TypeCompound> rawTypeAttributes = symbol.getRawTypeAttributes().stream();
+  /**
+   * Gets the type use annotations on a symbol, ignoring annotations on components of the type (type
+   * arguments, wildcards, etc.)
+   */
+  public static Stream<Attribute.TypeCompound> getTypeUseAnnotations(Symbol symbol) {
+    return getTypeUseAnnotations(symbol, /* onlyDirect= */ true);
+  }
+
+  /**
+   * Gets the type use annotations on a symbol
+   *
+   * @param symbol the symbol
+   * @param onlyDirect if true, only return annotations that are directly on the type, not on
+   *     components of the type (type arguments, wildcards, array contents, etc.)
+   * @return the type use annotations on the symbol
+   */
+  private static Stream<Attribute.TypeCompound> getTypeUseAnnotations(
+      Symbol symbol, boolean onlyDirect) {
+    // Adapted from Error Prone's MoreAnnotations class:
+    // https://github.com/google/error-prone/blob/5f71110374e63f3c35b661f538295fa15b5c1db2/check_api/src/main/java/com/google/errorprone/util/MoreAnnotations.java#L84-L91
+    Symbol typeAnnotationOwner =
+        symbol.getKind().equals(ElementKind.PARAMETER) ? symbol.owner : symbol;
+    Stream<Attribute.TypeCompound> rawTypeAttributes =
+        typeAnnotationOwner.getRawTypeAttributes().stream();
     if (symbol instanceof Symbol.MethodSymbol) {
-      // for methods, we want the type-use annotations on the return type
-      return rawTypeAttributes.filter((t) -> t.position.type.equals(TargetType.METHOD_RETURN));
+      // for methods, we want annotations on the return type
+      return rawTypeAttributes.filter(
+          (t) ->
+              t.position.type.equals(TargetType.METHOD_RETURN)
+                  && (!onlyDirect || isDirectTypeUseAnnotation(t, symbol)));
+    } else {
+      // filter for annotations directly on the type
+      return rawTypeAttributes.filter(
+          t ->
+              targetTypeMatches(symbol, t.position)
+                  && (!onlyDirect || isDirectTypeUseAnnotation(t, symbol)));
     }
-    return rawTypeAttributes;
+  }
+
+  // Adapted from Error Prone MoreAnnotations:
+  // https://github.com/google/error-prone/blob/5f71110374e63f3c35b661f538295fa15b5c1db2/check_api/src/main/java/com/google/errorprone/util/MoreAnnotations.java#L128
+  private static boolean targetTypeMatches(Symbol sym, TypeAnnotationPosition position) {
+    switch (sym.getKind()) {
+      case LOCAL_VARIABLE, BINDING_VARIABLE -> {
+        return position.type == TargetType.LOCAL_VARIABLE;
+      }
+      case FIELD, ENUM_CONSTANT -> {
+        // treated like a field
+        return position.type == TargetType.FIELD;
+      }
+      case CONSTRUCTOR, METHOD -> {
+        return position.type == TargetType.METHOD_RETURN;
+      }
+      case PARAMETER -> {
+        if (position.type.equals(TargetType.METHOD_FORMAL_PARAMETER)) {
+          int parameterIndex = position.parameter_index;
+          if (position.onLambda != null) {
+            com.sun.tools.javac.util.List<JCTree.JCVariableDecl> lambdaParams =
+                position.onLambda.params;
+            return parameterIndex >= 0
+                && parameterIndex < lambdaParams.size()
+                && lambdaParams.get(parameterIndex).sym.equals(sym);
+          } else {
+            return ((Symbol.MethodSymbol) sym.owner).getParameters().indexOf(sym) == parameterIndex;
+          }
+        } else {
+          return false;
+        }
+      }
+      case CLASS, ENUM, RECORD -> {
+        // treated like a class
+        // There are no type annotations on the top-level type of the class/enum/record being
+        // declared,
+        // only on other types in the signature (e.g. `class Foo extends Bar<@A Baz> {}`).
+        return false;
+      }
+      default -> {
+        throw new AssertionError("unsupported element kind " + sym.getKind() + " symbol " + sym);
+      }
+    }
+  }
+
+  /**
+   * Check whether a type-use annotation should be treated as applying directly to the top-level
+   * type
+   *
+   * <p>For example {@code @Nullable List<T> lst} is a direct type use annotation of {@code lst},
+   * but {@code List<@Nullable T> lst} is not.
+   *
+   * @param t the annotation and its position in the type
+   * @param symbol the symbol for the annotated element
+   * @return {@code true} if the annotation should be treated as applying directly to the top-level
+   *     type, false otherwise
+   */
+  private static boolean isDirectTypeUseAnnotation(Attribute.TypeCompound t, Symbol symbol) {
+    // location is a list of TypePathEntry objects, indicating whether the annotation is
+    // on an array, inner type, wildcard, or type argument. If it's empty, then the
+    // annotation is directly on the type.
+    // Annotations on array dimensions, wildcards, or type arguments do not apply to the top-level
+    // type. For nested classes, an annotation applies directly only when placed on the innermost
+    // type.
+    int innerTypeCount = 0;
+    for (TypePathEntry entry : t.position.location) {
+      switch (entry.tag) {
+        case INNER_TYPE -> {
+          innerTypeCount++;
+        }
+        case ARRAY -> {
+          return false;
+        }
+        default -> {
+          // Wildcard or type argument!
+          return false;
+        }
+      }
+    }
+    // For non-nested classes annotations apply to the innermost type.
+    if (!isTypeOfNestedClass(symbol.type)) {
+      return true;
+    }
+    // For nested classes the annotation is only valid if it is on the innermost type.
+    return innerTypeCount == getNestingDepth(symbol.type) - 1;
+  }
+
+  private static int getNestingDepth(Type type) {
+    int depth = 0;
+    for (Type curr = type;
+        curr != null && !curr.hasTag(TypeTag.NONE);
+        curr = curr.getEnclosingType()) {
+      depth++;
+    }
+    return depth;
+  }
+
+  private static boolean isTypeOfNestedClass(Type type) {
+    return type.tsym != null && type.tsym.owner instanceof Symbol.ClassSymbol;
   }
 
   /**
@@ -305,14 +533,12 @@ public class NullabilityUtil {
    * @return true if based on the type, package, and name of the field, the analysis should assume
    *     the field might be null; false otherwise
    */
-  public static boolean mayBeNullFieldFromType(@Nullable Symbol symbol, Config config) {
-    if (symbol == null) {
-      return true;
-    }
+  public static boolean mayBeNullFieldFromType(
+      Symbol symbol, Config config, Handler handler, CodeAnnotationInfo codeAnnotationInfo) {
     return !(symbol.getSimpleName().toString().equals("class")
             || symbol.isEnum()
-            || isUnannotated(symbol, config))
-        && Nullness.hasNullableAnnotation(symbol, config);
+            || codeAnnotationInfo.isSymbolUnannotated(symbol, config, handler))
+        && Nullness.hasNullableOrMonotonicNonNullAnnotation(symbol, config);
   }
 
   /**
@@ -320,44 +546,320 @@ public class NullabilityUtil {
    *
    * @param nullness The nullness value.
    * @return true if the nullness value represents a {@code Nullable} value. To be more specific, it
-   *     returns true if the nullness value is either {@link Nullness#NULL} or {@link
-   *     Nullness#NULLABLE}.
+   *     returns true if the nullness value is {@link Nullness#NULL}, {@link Nullness#NULLABLE},
+   *     {@link Nullness#NO_CHANGE}, or {@link Nullness#NULL_NO_CHANGE}.
    */
   public static boolean nullnessToBool(Nullness nullness) {
-    switch (nullness) {
-      case BOTTOM:
-      case NONNULL:
-        return false;
-      case NULL:
-      case NULLABLE:
-        return true;
-      default:
-        throw new AssertionError("Impossible: " + nullness);
+    return switch (nullness) {
+      case BOTTOM, NONNULL -> false;
+      case NULL, NULLABLE, NO_CHANGE, NULL_NO_CHANGE -> true;
+    };
+  }
+
+  /**
+   * Checks if {@code symbol} is a method on {@code java.util.Map} (or a subtype) with name {@code
+   * methodName} and {@code numParams} parameters
+   */
+  public static boolean isMapMethod(
+      Symbol.MethodSymbol symbol, VisitorState state, String methodName, int numParams) {
+    if (!symbol.getSimpleName().toString().equals(methodName)) {
+      return false;
     }
+    if (symbol.getParameters().size() != numParams) {
+      return false;
+    }
+    Symbol owner = symbol.owner;
+    return ASTHelpers.isSubtype(owner.type, MAP_TYPE_SUPPLIER.get(state), state);
+  }
+
+  /** Checks whether {@code symbol} is {@code java.util.Map.getOrDefault} or overrides it. */
+  public static boolean isMapGetOrDefault(Symbol.MethodSymbol symbol, VisitorState state) {
+    if (!isMapMethod(symbol, state, "getOrDefault", 2)) {
+      return false;
+    }
+    Symbol.TypeSymbol mapSymbol = MAP_TYPE_SUPPLIER.get(state).tsym;
+    return symbol.owner.equals(mapSymbol)
+        || ASTHelpers.findSuperMethods(symbol, state.getTypes()).stream()
+            .anyMatch(superMethod -> superMethod.owner.equals(mapSymbol));
   }
 
   /**
-   * Check if a symbol comes from unannotated code.
+   * Downcasts a {@code @Nullable} argument to {@code NonNull}, returning the argument
    *
-   * @param symbol symbol for entity
-   * @param config NullAway config
-   * @return true if symbol represents an entity from a class that is unannotated; false otherwise
+   * @throws NullPointerException if argument is {@code null}
    */
-  public static boolean isUnannotated(Symbol symbol, Config config) {
-    Symbol.ClassSymbol outermostClassSymbol = getOutermostClassSymbol(symbol);
-    return !config.fromAnnotatedPackage(outermostClassSymbol)
-        || config.isUnannotatedClass(outermostClassSymbol);
+  public static <T> T castToNonNull(@Nullable T obj) {
+    if (obj == null) {
+      throw new NullPointerException("castToNonNull failed!");
+    }
+    return obj;
   }
 
   /**
-   * Check if a symbol comes from generated code.
+   * Checks if the given array symbol has a {@code @Nullable} annotation for its elements.
    *
-   * @param symbol symbol for entity
-   * @return true if symbol represents an entity from a class annotated with {@code @Generated};
-   *     false otherwise
+   * @param arraySymbol The symbol of the array to check.
+   * @param config NullAway configuration.
+   * @return true if the array symbol has a {@code @Nullable} annotation for its elements, false
+   *     otherwise
    */
-  public static boolean isGenerated(Symbol symbol) {
-    Symbol.ClassSymbol outermostClassSymbol = getOutermostClassSymbol(symbol);
-    return ASTHelpers.hasDirectAnnotationWithSimpleName(outermostClassSymbol, "Generated");
+  public static boolean isArrayElementNullable(Symbol arraySymbol, Config config) {
+    return checkArrayElementAnnotations(
+        arraySymbol,
+        config,
+        Nullness::isNullableAnnotation,
+        Nullness::hasNullableDeclarationAnnotation);
+  }
+
+  /**
+   * Checks if the given array type has a {@code @Nullable} annotation for its elements.
+   *
+   * @param arrayType the array type, or {@code null}
+   * @param config NullAway configuration
+   * @return true if the array type has a {@code @Nullable} annotation for its elements, false
+   *     otherwise
+   */
+  public static boolean isArrayElementNullable(@Nullable Type arrayType, Config config) {
+    return arrayType != null
+        && arrayType.getKind() == TypeKind.ARRAY
+        && Nullness.hasNullableAnnotation(
+            ((Type.ArrayType) arrayType).getComponentType().getAnnotationMirrors().stream(),
+            config);
+  }
+
+  /**
+   * Checks if the elements of the array an expression evaluates to are {@code @Nullable}. Reads the
+   * annotations from the expression's symbol when it has one, and from the expression's type
+   * otherwise, as for a cast like {@code ((@Nullable String[]) o)}. For a variable other than a
+   * field, it also reads the type of the symbol, which for a {@code var} local carries the
+   * annotations inferred from the initializer that its declaration does not.
+   *
+   * @param arrayExpr an expression of array type
+   * @param config NullAway configuration
+   * @return true if the array elements are {@code @Nullable}, false otherwise
+   */
+  public static boolean isArrayExpressionElementNullable(ExpressionTree arrayExpr, Config config) {
+    ExpressionTree expr = ASTHelpers.stripParentheses(arrayExpr);
+    Symbol arraySymbol = ASTHelpers.getSymbol(expr);
+    if (arraySymbol != null) {
+      return isArrayElementNullable(arraySymbol, config)
+          || (arraySymbol instanceof Symbol.VarSymbol
+              && !arraySymbol.getKind().isField()
+              && isArrayElementNullable(arraySymbol.type, config));
+    }
+    return isArrayElementNullable(arrayExpressionType(expr), config);
+  }
+
+  /**
+   * Returns the type of an array expression, with the type-use annotations of the declared type of
+   * a variable other than a field that it reads, such as the element type of a local {@code l} for
+   * {@code l[0]}. For an array access whose innermost array is such a variable, this method takes
+   * the variable's type from its symbol and projects it to the accessed component. Before JDK 27,
+   * javac attaches the annotations of a local variable or an explicitly typed lambda parameter to
+   * the symbol only after it has attributed the whole class body, so the type of a use of the
+   * variable lacks them (JDK-8371155); the symbol has them on every JDK. A field keeps the type of
+   * the use, which carries the substitution for a field read through a parameterized receiver.
+   *
+   * @param expr an expression of array type, without enclosing parentheses
+   * @return the type of {@code expr}, or {@code null} if javac recorded none
+   */
+  private static @Nullable Type arrayExpressionType(ExpressionTree expr) {
+    if (expr instanceof ArrayAccessTree arrayAccess) {
+      ExpressionTree array = ASTHelpers.stripParentheses(arrayAccess.getExpression());
+      Symbol arraySymbol = ASTHelpers.getSymbol(array);
+      Type arrayType =
+          arraySymbol instanceof Symbol.VarSymbol && !arraySymbol.getKind().isField()
+              ? arraySymbol.type
+              : arrayExpressionType(array);
+      if (arrayType // diff-coverage: ignore -- javac types the array of an array access as an array
+          instanceof Type.ArrayType arrayTypeWithComponent) {
+        return arrayTypeWithComponent.getComponentType();
+      }
+    }
+    return ASTHelpers.getType(expr);
+  }
+
+  /**
+   * Checks if the given varargs symbol has a {@code @Nullable} annotation for its elements. Works
+   * for both source and bytecode.
+   *
+   * @param varargsSymbol the symbol of the varargs parameter
+   * @param config NullAway configuration
+   * @return true if the varargs symbol has a {@code @Nullable} annotation for its elements, false
+   *     otherwise
+   */
+  public static boolean nullableVarargsElementsForSourceOrBytecode(
+      Symbol varargsSymbol, Config config) {
+    return isArrayElementNullable(varargsSymbol, config)
+        || Nullness.hasNullableDeclarationAnnotation(varargsSymbol, config);
+  }
+
+  /**
+   * Checks if the given array symbol has a {@code @NonNull} annotation for its elements.
+   *
+   * @param arraySymbol The symbol of the array to check.
+   * @param config NullAway configuration.
+   * @return true if the array symbol has a {@code @NonNull} annotation for its elements, false
+   *     otherwise
+   */
+  public static boolean isArrayElementNonNull(Symbol arraySymbol, Config config) {
+    return checkArrayElementAnnotations(
+        arraySymbol,
+        config,
+        Nullness::isNonNullAnnotation,
+        Nullness::hasNonNullDeclarationAnnotation);
+  }
+
+  /**
+   * Checks if the given varargs symbol has a {@code @NonNull} annotation for its elements. Works
+   * for both source and bytecode.
+   *
+   * @param varargsSymbol the symbol of the varargs parameter
+   * @param config NullAway configuration
+   * @return true if the varargs symbol has a {@code @NonNull} annotation for its elements, false
+   *     otherwise
+   */
+  public static boolean nonnullVarargsElementsForSourceOrBytecode(
+      Symbol varargsSymbol, Config config) {
+    return isArrayElementNonNull(varargsSymbol, config)
+        || Nullness.hasNonNullDeclarationAnnotation(varargsSymbol, config);
+  }
+
+  /**
+   * Checks if the annotations on the elements of some array symbol satisfy some predicate.
+   *
+   * @param arraySymbol the array symbol
+   * @param config NullAway configuration
+   * @param typeUseCheck the predicate to check the type-use annotations
+   * @param declarationCheck the predicate to check the declaration annotations (applied only to
+   *     varargs symbols)
+   * @return true if the annotations on the elements of the array symbol satisfy the given
+   *     predicates, false otherwise
+   */
+  private static boolean checkArrayElementAnnotations(
+      Symbol arraySymbol,
+      Config config,
+      BiPredicate<String, Config> typeUseCheck,
+      BiPredicate<Symbol, Config> declarationCheck) {
+    if (getTypeUseAnnotations(arraySymbol, /* onlyDirect= */ false)
+        .anyMatch(
+            t -> {
+              // the location list should be of length 1 and the entry tag should be ARRAY
+              com.sun.tools.javac.util.List<TypePathEntry> location = t.position.location;
+              TypePathEntry head = location.head;
+              boolean singleElementList = head != null && location.tail.isEmpty();
+              if (singleElementList && head.tag == TypeAnnotationPosition.TypePathEntryKind.ARRAY) {
+                return typeUseCheck.test(t.type.toString(), config);
+              }
+              return false;
+            })) {
+      return true;
+    }
+    // For varargs symbols we also check for declaration annotations on the parameter
+    // NOTE this flag check does not work for the varargs parameter of a method defined in bytecodes
+    if ((arraySymbol.flags() & Flags.VARARGS) != 0) {
+      return declarationCheck.test(arraySymbol, config);
+    }
+    return false;
+  }
+
+  /**
+   * Does the given symbol have a JetBrains @NotNull declaration annotation? Useful for workarounds
+   * in light of https://github.com/uber/NullAway/issues/720
+   */
+  public static boolean hasJetBrainsNotNullDeclarationAnnotation(Symbol varSymbol) {
+    // We explicitly ignore type-use annotations here, looking for @NotNull used as a
+    // declaration annotation, which is why this logic is simpler than e.g.
+    // NullabilityUtil.getAllAnnotationsForParameter.
+    return varSymbol.getAnnotationMirrors().stream()
+        .map(a -> a.getAnnotationType().toString())
+        .anyMatch(annotName -> annotName.equals(JETBRAINS_NOT_NULL));
+  }
+
+  /**
+   * Checks if the method invocation is a varargs call, i.e., if individual arguments are being
+   * passed in the varargs position. If false, it means that an array is being passed in the varargs
+   * position.
+   *
+   * @param tree the method invocation tree (MethodInvocationTree or NewClassTree)
+   * @return true if the method invocation is a varargs call, false otherwise
+   */
+  public static boolean isVarArgsCall(Tree tree) {
+    // javac sets the varargsElement field to a non-null value if the invocation is a varargs call
+    Type varargsElement =
+        tree instanceof JCTree.JCMethodInvocation jcMethodInvocation
+            ? jcMethodInvocation.varargsElement
+            : ((JCTree.JCNewClass) tree).varargsElement;
+    return varargsElement != null;
+  }
+
+  /**
+   * strip out enclosing parentheses, type casts and Nullchk operators.
+   *
+   * @param expr a potentially parenthesised expression.
+   * @return the same expression without parentheses.
+   */
+  public static ExpressionTree stripParensAndCasts(ExpressionTree expr) {
+    boolean someChange = true;
+    while (someChange) {
+      someChange = false;
+      if (expr instanceof ParenthesizedTree) {
+        expr = ((ParenthesizedTree) expr).getExpression();
+        someChange = true;
+      }
+      if (expr instanceof TypeCastTree) {
+        expr = ((TypeCastTree) expr).getExpression();
+        someChange = true;
+      }
+
+      // Strips Nullchk operator
+      if (expr.getKind().equals(OTHER) && expr instanceof JCTree.JCUnary) {
+        expr = ((JCTree.JCUnary) expr).getExpression();
+        someChange = true;
+      }
+    }
+    return expr;
+  }
+
+  /**
+   * Returns an updated version of {@code path} with {@code leaf} as the leaf, if needed. If {@code
+   * leaf} is already the leaf of {@code path} (compared using reference equality), just return
+   * {@code path} unmodified.
+   */
+  @SuppressWarnings("ReferenceEquality") // deliberate
+  public static TreePath pathWithLeaf(TreePath path, Tree leaf) {
+    return path.getLeaf() == leaf ? path : new TreePath(path, leaf);
+  }
+
+  /**
+   * A pair of an expression tree and a VisitorState, used by {@link #stripParensAndUpdateTreePath}
+   */
+  public record ExprTreeAndState(ExpressionTree expr, VisitorState state) {}
+
+  /**
+   * strip out enclosing parentheses, and update the tree path in the VisitorState to point to the
+   * stripped expression if the original expression was the leaf of the path
+   *
+   * @param expr a potentially parenthesised expression.
+   * @param state the VisitorState
+   * @return the same expression without parentheses, and the updated VisitorState
+   */
+  public static ExprTreeAndState stripParensAndUpdateTreePath(
+      ExpressionTree expr, VisitorState state) {
+    TreePath path = state.getPath();
+    @SuppressWarnings("ReferenceEquality")
+    boolean leafNotExpr = path.getLeaf() != expr;
+    if (leafNotExpr) {
+      throw new RuntimeException(
+          String.format("Wrong leaf %s in path to %s", path.getLeaf(), expr));
+    }
+    ExpressionTree resultExpr = expr;
+    while (resultExpr instanceof ParenthesizedTree) {
+      resultExpr = ((ParenthesizedTree) resultExpr).getExpression();
+      path = new TreePath(path, resultExpr);
+    }
+    @SuppressWarnings("ReferenceEquality")
+    VisitorState resultState = path == state.getPath() ? state : state.withPath(path);
+    return new ExprTreeAndState(resultExpr, resultState);
   }
 }

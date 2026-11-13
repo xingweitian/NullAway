@@ -1,0 +1,84 @@
+import net.ltgt.gradle.errorprone.CheckSeverity
+
+plugins {
+    id 'java'
+    // we use the shadow jar when building the JDK
+    id 'com.gradleup.shadow'
+    id 'nullaway.java-test-conventions'
+}
+
+// We require JDK 21, since we rely on some internal String formatting of javac types and don't support
+// the pre-JDK-21 formats
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+// Allow Java 21 features for this module
+tasks.withType(JavaCompile).configureEach {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.compilerArgs += [
+        "--add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.comp=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.main=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.model=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.processing=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.source.tree=ALL-UNNAMED",
+    ]
+    if (!name.toLowerCase().contains("test")) {
+        options.errorprone {
+            check("NullAway", CheckSeverity.ERROR)
+            option("NullAway:OnlyNullMarked")
+            option("NullAway:JSpecifyMode")
+            option("NullAway:AcknowledgeRestrictiveAnnotations")
+            check("RequireExplicitNullMarking", CheckSeverity.ERROR)
+        }
+    }
+}
+
+configurations {
+    // We use this configuration to expose a module path that can be
+    // used to test handling of modules
+    testModulePath
+}
+
+dependencies {
+    annotationProcessor project(":nullaway")
+
+    implementation libs.gson
+    implementation libs.jspecify
+    implementation libs.guava
+    implementation project(":library-model:library-model-generator")
+
+    testImplementation libs.junit4
+    testImplementation(libs.error.prone.test.helpers) {
+        exclude group: "junit", module: "junit"
+    }
+    testImplementation libs.jspecify
+    testImplementation libs.gson
+    testImplementation libs.assertj
+
+    testModulePath libs.jspecify
+}
+
+tasks.withType(Test).configureEach { test ->
+    test.jvmArgs += [
+        // Expose a module path for tests as a JVM property.
+        "-Dtest.module.path=${configurations.testModulePath.asPath}"
+    ]
+}
+
+// Don't test on JDK 17 since we don't support the JDK 17 javac string formatting
+tasks.named("testJdk17").configure {
+    onlyIf { false }
+}

@@ -1,0 +1,91 @@
+/*
+ * Copyright (c) 2022 Uber Technologies, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+package com.uber.nullaway.fixserialization.location;
+
+import com.sun.tools.javac.code.Symbol;
+import com.uber.nullaway.fixserialization.adapters.SerializationAdapter;
+import javax.xml.stream.XMLStreamException;
+import javax.xml.stream.XMLStreamWriter;
+
+/** Provides method for symbol locations. */
+public interface SymbolLocation {
+
+  /**
+   * returns string representation of contents of the instance. It must have the format below: kind
+   * of the element, symbol of the containing class, symbol of the enclosing method, symbol of the
+   * variable, index of the element and uri to containing file.
+   *
+   * @param adapter adapter used to serialize symbols.
+   * @return string representation of contents in a line seperated by tabs.
+   */
+  String tabSeparatedToString(SerializationAdapter adapter);
+
+  /**
+   * Writes an XML representation of this location to {@code writer}. Emits a sequence of child
+   * elements (no wrapping tag); the caller is responsible for the enclosing element.
+   *
+   * @param writer the writer to emit to.
+   * @param adapter adapter used to serialize symbols.
+   */
+  void writeXmlFields(XMLStreamWriter writer, SerializationAdapter adapter)
+      throws XMLStreamException;
+
+  /**
+   * Creates header of an output file containing all {@link SymbolLocation} written in string which
+   * values are separated tabs.
+   *
+   * @return string representation of the header separated by tabs.
+   */
+  static String header() {
+    return String.join("\t", "kind", "class", "method", "param", "index", "uri");
+  }
+
+  /**
+   * returns the appropriate subtype of {@link SymbolLocation} based on the target kind.
+   *
+   * @param target Target element.
+   * @return subtype of {@link SymbolLocation} matching target's type.
+   */
+  static SymbolLocation createLocationFromSymbol(Symbol target) {
+    return switch (target.getKind()) {
+      case PARAMETER -> new MethodParameterLocation(target);
+      case METHOD -> new MethodLocation(target);
+      case FIELD -> new FieldLocation(target);
+      // The case where a local variable is declared inside a lambda expression is currently not
+      // handled. This will require changes to how LocalVariableLocation is created.
+      // An example of the case :
+      // void shadowInLambda() {
+      //   Object[] l = new Object[12];
+      //   a.exec(
+      //           () -> {
+      //             Object[] l = new Object[10];
+      //             // BUG: Diagnostic contains: Writing @Nullable expression into array with
+      // @NonNull contents.
+      //             l[0] = null;
+      //           });
+      // }
+      case LOCAL_VARIABLE -> new LocalVariableLocation(target);
+      default -> throw new IllegalArgumentException("Cannot locate node: " + target);
+    };
+  }
+}

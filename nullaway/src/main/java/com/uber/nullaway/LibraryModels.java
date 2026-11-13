@@ -22,12 +22,19 @@
 
 package com.uber.nullaway;
 
+import static com.uber.nullaway.NullabilityUtil.castToNonNull;
+
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ImmutableSetMultimap;
 import com.sun.tools.javac.code.Symbol;
+import com.uber.nullaway.handlers.stream.StreamTypeRecord;
+import com.uber.nullaway.libmodel.NestedAnnotationInfo;
 import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.jspecify.annotations.Nullable;
 
 /** Provides models for library routines for the null checker. */
 public interface LibraryModels {
@@ -35,16 +42,16 @@ public interface LibraryModels {
   /**
    * Get methods which fail/error out when passed null.
    *
-   * @return map from the names of null-rejecting methods to the indexes of the arguments that
-   *     aren't permitted to be null.
+   * @return map from null-rejecting methods to the indexes of the arguments that aren't permitted
+   *     to be null.
    */
   ImmutableSetMultimap<MethodRef, Integer> failIfNullParameters();
 
   /**
    * Get (method, parameter) pairs that must be modeled as if explicitly annotated with @Nullable.
    *
-   * @return map from the names of methods with @Nullable parameters to the indexes of the arguments
-   *     that are @Nullable.
+   * @return map from methods with @Nullable parameters to the indexes of the arguments that
+   *     are @Nullable.
    *     <p>This is taken into account for override checks, requiring methods that override the
    *     methods listed here to take @Nullable parameters on the same indexes. The main use for this
    *     is to document which API callbacks can be passed null values.
@@ -54,8 +61,8 @@ public interface LibraryModels {
   /**
    * Get (method, parameter) pairs that must be modeled as @NonNull.
    *
-   * @return map from the names of methods with @NonNull parameters to the indexes of the arguments
-   *     that are @NonNull.
+   * @return map from methods with @NonNull parameters to the indexes of the arguments that
+   *     are @NonNull.
    *     <p>Note that these methods are different from the {@link #failIfNullParameters()} methods,
    *     in that we expect the null checker to ensure that the parameters passed to these methods
    *     are @NonNull. In contrast, the null checker does no such enforcement for methods in {@link
@@ -67,29 +74,55 @@ public interface LibraryModels {
   /**
    * Get (method, parameter) pairs that cause the method to return <code>true</code> when null.
    *
-   * @return map from the names of null-querying methods to the indexes of the arguments that are
-   *     compared against null.
+   * @return map from null-querying methods to the indexes of the arguments that are compared
+   *     against null.
    */
   ImmutableSetMultimap<MethodRef, Integer> nullImpliesTrueParameters();
 
   /**
    * Get (method, parameter) pairs that cause the method to return <code>false</code> when null.
    *
-   * @return map from the names of non-null-querying methods to the indexes of the arguments that
-   *     are compared against null.
+   * @return map from non-null-querying methods to the indexes of the arguments that are compared
+   *     against null.
    */
   ImmutableSetMultimap<MethodRef, Integer> nullImpliesFalseParameters();
 
   /**
-   * Get (method, parameter) pairs that cause the method to return <code>null</code> when passed
-   * <code>null</code> on that parameter.
+   * Get (method, target method) pairs where returning <code>true</code> implies the target method
+   * on the receiver is non-null.
    *
-   * <p>This is equivalent to annotating a method with a contract like:
+   * @return map from querying methods to target receiver methods that are non-null when returning
+   *     true.
+   */
+  default ImmutableSetMultimap<MethodRef, MethodRef> ensuresNonNullIfTrueMethodCalls() {
+    return ImmutableSetMultimap.of();
+  }
+
+  /**
+   * Gets methods and parameter indexes whose arguments determine the return nullness. The model
+   * guarantees a non-null return when all listed arguments are non-null; otherwise the return may
+   * be null.
+   *
+   * <p>For ordinary calls to a one-parameter method, this provides the same return-nullness
+   * refinement as a {@code @Nullable} return type combined with a {@code @Contract} annotation
+   * specifying that a non-null argument implies a non-null return:
    *
    * <pre><code>@Contract("!null -&gt; !null") @Nullable</code></pre>
    *
-   * @return map from the names of null-in-implies-null out methods to the indexes of the arguments
-   *     that determine nullness of the return.
+   * <p>The model also applies to method references: the parameter types of the functional interface
+   * method stand in for the call arguments. For example, {@code input.map(String.class::cast)}
+   * preserves non-null element types when the elements of {@code input} are non-null. For an
+   * unbound instance method reference, the indexes refer to the referenced method's declared
+   * parameters and do not count the receiver parameter of the functional interface method.
+   *
+   * <p>The equivalence to {@code @Contract} does not currently extend to method references:
+   * contracts have more limited support for unbound references and generic inference (see <a
+   * href="https://github.com/uber/NullAway/issues/1986">issue #1986</a>).
+   *
+   * <p>The model applies to any method that overrides the listed method. NullAway does not check
+   * that such an override obeys the contract (issue #803).
+   *
+   * @return map from modeled methods to the indexes of the arguments that determine return nullness
    */
   ImmutableSetMultimap<MethodRef, Integer> nullImpliesNullParameters();
 
@@ -108,7 +141,127 @@ public interface LibraryModels {
   ImmutableSet<MethodRef> nonNullReturns();
 
   /**
-   * representation of a method as a qualified class name + a signature for the method
+   * For each library method key, provides a mapping from parameter index to the nested annotation
+   * information for that parameter type. A parameter index of -1 indicates the return type.
+   */
+  default ImmutableMap<MethodRef, ImmutableSetMultimap<Integer, NestedAnnotationInfo>>
+      nestedAnnotationsForMethods() {
+    return ImmutableMap.of();
+  }
+
+  /**
+   * Get the locations in library method signatures that have linked, polymorphic nullness.
+   *
+   * <p>All locations listed for a method share the same nullness at each call. NullAway infers it
+   * from the arguments, including lambda and method-reference results, and from the assignment
+   * target, and then substitutes it at every modeled location present in the method type. Explicit
+   * method type arguments are substituted first, and at a modeled location the linked nullness
+   * replaces the nullness the type argument supplied.
+   *
+   * <p>This model is used only when {@code JSpecifyMode} and {@code JSpecifyExperimental} are
+   * enabled. A PolyNull location takes precedence over any fixed nullable or non-null library model
+   * for the same location, including models on overriding methods when the PolyNull model is
+   * inherited. A parameter that has both a nullable and a non-null fixed model is rejected with
+   * {@link IllegalStateException} wherever NullAway reads the parameter models of the method, such
+   * as at a call or an override, even when a PolyNull location covers the parameter. Models at
+   * other locations retain their existing behavior. A top-level PolyNull return also takes
+   * precedence over a {@link #nullImpliesNullParameters()} model. A PolyNull model on an overriding
+   * method replaces the inherited model's entire location set. Receiver locations are not supported
+   * and are rejected with {@link IllegalArgumentException}.
+   *
+   * <p>Each modeled method must include at least one location with a non-empty type path. Use
+   * existing contract-style models like {@link #nullImpliesNullParameters()} for relationships
+   * involving only top-level nullness.
+   *
+   * <p>A user provider's location set replaces the entire built-in PolyNull model for the same
+   * method. Multiple user providers may supply identical location sets, but differing sets for the
+   * same method are rejected. Methods excluded by {@code IgnoreLibraryModelsFor} do not participate
+   * in conflict detection. Each provider's models are still validated when excluded.
+   *
+   * @return map from methods to signature locations with polymorphic nullness
+   */
+  default ImmutableSetMultimap<MethodRef, PolyNullLocation> polyNullLocations() {
+    return ImmutableSetMultimap.of();
+  }
+
+  /**
+   * Get the (className, type argument index) pairs for library classes where the generic type
+   * variable has a {@code @Nullable} upper bound. Only used in JSpecify mode.
+   *
+   * @return map from the className to the positions of the generic type variables that have a
+   *     {@code Nullable} upper bound.
+   */
+  default ImmutableSetMultimap<String, Integer> typeVariablesWithNullableUpperBounds() {
+    return ImmutableSetMultimap.of();
+  }
+
+  /**
+   * Get the (method, type argument index) pairs for library methods where the generic type variable
+   * has a {@code @Nullable} upper bound. Only used in JSpecify mode
+   *
+   * @return map from the method to the positions of the generic type variables that have a {@code
+   *     Nullable} upper bound.
+   */
+  default ImmutableSetMultimap<MethodRef, Integer> methodTypeVariablesWithNullableUpperBounds() {
+    return ImmutableSetMultimap.of();
+  }
+
+  /**
+   * Get the set of library classes that are NullMarked. Only used in JSpecify mode.
+   *
+   * @return set of library classes that are NullMarked.
+   */
+  default ImmutableSet<String> nullMarkedClasses() {
+    return ImmutableSet.of();
+  }
+
+  /**
+   * Get (method, parameter) pairs that act as castToNonNull(...) methods.
+   *
+   * <p>Here, the parameter index determines the argument position of the reference being cast to
+   * non-null.
+   *
+   * <p>We still provide the CLI configuration `-XepOpt:NullAway:CastToNonNullMethod` as the default
+   * way to define the common case of a single-argument {@code @NonNull Object
+   * castToNonNull(@Nullable Object o)}} cast method.
+   *
+   * <p>However, in some cases, the user might wish to have a cast method that takes multiple
+   * arguments, in addition to the <code>@Nullable</code> value being cast. For these cases,
+   * providing a library model allows for more precise error reporting whenever a known non-null
+   * value is passed to such method, rendering the cast unnecessary.
+   *
+   * <p>Note that we can't auto-add castToNonNull(...) methods taking more than one argument, simply
+   * because there might be no general, automated way of synthesizing the required arguments.
+   */
+  ImmutableSetMultimap<MethodRef, Integer> castToNonNullMethods();
+
+  /**
+   * Get the set of library fields that may be {@code null}.
+   *
+   * @return set of library fields that may be {@code null}.
+   */
+  default ImmutableSet<FieldRef> nullableFields() {
+    return ImmutableSet.of();
+  }
+
+  /**
+   * Get a list of custom stream library specifications.
+   *
+   * <p>This allows users to define filter/map/other methods for APIs which behave similarly to Java
+   * 8 streams or ReactiveX streams, so that NullAway is able to understand nullability invariants
+   * across stream API calls. See {@link com.uber.nullaway.handlers.stream.StreamModelBuilder} for
+   * details on how to construct these {@link com.uber.nullaway.handlers.stream.StreamTypeRecord}
+   * specs. A full example is available in {@code TestLibraryModels} in the {@code
+   * test-library-models} subproject.
+   *
+   * @return A list of StreamTypeRecord specs (usually generated using StreamModelBuilder).
+   */
+  default ImmutableList<StreamTypeRecord> customStreamNullabilitySpecs() {
+    return ImmutableList.of();
+  }
+
+  /**
+   * Representation of a method as a qualified class name + a signature for the method
    *
    * <p>The formatting of a method signature should match the result of calling {@link
    * Symbol.MethodSymbol#toString()} on the corresponding symbol. See {@link
@@ -116,8 +269,8 @@ public interface LibraryModels {
    * principles:
    *
    * <ul>
-   *   <li>signature is a method name plus argument types, e.g., <code>foo(java.lang.Object,
-   *  java.lang.String)</code>
+   *   <li>signature is a method name plus argument types, with no spaces between the argument
+   *       types, e.g., <code>foo(java.lang.Object,java.lang.String)</code>
    *   <li>constructor for class Foo looks like <code>Foo(java.lang.String)</code>
    *   <li>If the method has its own type parameters, they need to be declared, like <code>
    *       &lt;T&gt;checkNotNull(T)</code>
@@ -126,9 +279,10 @@ public interface LibraryModels {
    *  </code>
    * </ul>
    */
-  final class MethodRef {
+  public final class MethodRef {
 
     public final String enclosingClass;
+
     /**
      * we store the method name separately to enable fast comparison with MethodSymbols. See {@link
      * com.uber.nullaway.handlers.LibraryModelsHandler.OptimizedLibraryModels}
@@ -143,7 +297,14 @@ public interface LibraryModels {
       this.fullMethodSig = fullMethodSig;
     }
 
-    private static final Pattern METHOD_SIG_PATTERN = Pattern.compile("^(<.*>)?(\\w+)(\\(.*\\))$");
+    /**
+     * Pattern for parsing method signatures. The signature should be in the format: {@code
+     * <T1,T2,...>methodName(ArgType1,ArgType2,...)}.
+     *
+     * @see #methodRef(String, String)
+     */
+    private static final Pattern METHOD_SIG_PATTERN =
+        Pattern.compile("^(<.*>)?(\\w+|<init>)(\\(.*\\))$");
 
     /**
      * Construct a method reference.
@@ -155,7 +316,7 @@ public interface LibraryModels {
     public static MethodRef methodRef(String enclosingClass, String methodSignature) {
       Matcher matcher = METHOD_SIG_PATTERN.matcher(methodSignature);
       if (matcher.find()) {
-        String methodName = matcher.group(2);
+        String methodName = castToNonNull(matcher.group(2));
         if (methodName.equals(enclosingClass.substring(enclosingClass.lastIndexOf('.') + 1))) {
           // constructor
           methodName = "<init>";
@@ -167,14 +328,33 @@ public interface LibraryModels {
     }
 
     public static MethodRef fromSymbol(Symbol.MethodSymbol symbol) {
-      String methodStr = symbol.toString();
+      String methodStr = stripAnnotationsFromMethodSymbolString(symbol.toString());
 
       return new MethodRef(
           symbol.owner.getQualifiedName().toString(), symbol.name.toString(), methodStr);
     }
 
+    private static final Pattern ANNOTATION_STRIPPING_PATTERN = buildAnnotationStrippingPattern();
+
+    private static Pattern buildAnnotationStrippingPattern() {
+      String annotationWithSpace = "@[\\w.]+\\s";
+      // annotations within a varargs array can look like:
+      // java.lang.@org.jspecify.annotations.Nullable Object@org.jspecify.annotations.Nullable...
+      // we want to match the annotation without consuming the ellipsis, so we use a lookahead
+      String annotationOfVarargsArray = "@[\\w.]+(?=\\.\\.\\.)";
+      return Pattern.compile(annotationWithSpace + "|" + annotationOfVarargsArray);
+    }
+
+    /**
+     * Strip annotations from a method symbol string. The logic is specialized to work for strings
+     * produced by {@link Symbol.MethodSymbol#toString()} and will not work for arbitrary strings.
+     */
+    private static String stripAnnotationsFromMethodSymbolString(String str) {
+      return ANNOTATION_STRIPPING_PATTERN.matcher(str).replaceAll("");
+    }
+
     @Override
-    public boolean equals(Object o) {
+    public boolean equals(@Nullable Object o) {
       if (this == o) {
         return true;
       }
@@ -201,6 +381,63 @@ public interface LibraryModels {
           + fullMethodSig
           + '\''
           + '}';
+    }
+  }
+
+  /**
+   * A location within a method signature whose nullness is linked to other locations for the same
+   * method.
+   *
+   * @param position receiver, parameter, or return position in the method signature
+   * @param typePath path within the receiver, parameter, or return type; an empty path denotes its
+   *     top level
+   */
+  public record PolyNullLocation(
+      Position position, ImmutableList<NestedAnnotationInfo.TypePathEntry> typePath) {
+
+    /** Rejects receiver locations until polymorphic-nullness inference supports them. */
+    public static void validateNoReceiverLocations(
+        ImmutableSet<PolyNullLocation> locations, String methodDescription) {
+      if (locations.stream().anyMatch(location -> location.position() instanceof Receiver)) {
+        throw new IllegalArgumentException(
+            "PolyNull receiver locations are not yet supported for " + methodDescription);
+      }
+    }
+
+    /** Rejects models containing only top-level locations. */
+    public static void validateHasNestedLocation(
+        ImmutableSet<PolyNullLocation> locations, String methodDescription) {
+      if (locations.stream().allMatch(location -> location.typePath().isEmpty())) {
+        throw new IllegalArgumentException(
+            "PolyNull models must include at least one nested location for " + methodDescription);
+      }
+    }
+
+    /** A component of a method signature that may carry polymorphic nullness. */
+    public sealed interface Position permits Receiver, Parameter, Return {}
+
+    /** The method receiver. */
+    public record Receiver() implements Position {}
+
+    /** A zero-based method parameter (the receiver parameter is not counted). */
+    public record Parameter(int index) implements Position {
+      /** Rejects negative parameter indexes. */
+      public Parameter {
+        if (index < 0) {
+          throw new IllegalArgumentException("parameter index must be non-negative");
+        }
+      }
+    }
+
+    /** The method return type. */
+    public record Return() implements Position {}
+  }
+
+  /** Representation of a field as a qualified class name + a field name */
+  record FieldRef(String enclosingClassName, String fieldName) {
+
+    public static FieldRef fieldRef(String enclosingClass, String fieldName) {
+      return new FieldRef(enclosingClass, fieldName);
     }
   }
 }

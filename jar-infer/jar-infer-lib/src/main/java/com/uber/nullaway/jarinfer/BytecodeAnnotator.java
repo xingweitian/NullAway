@@ -15,6 +15,8 @@
  */
 package com.uber.nullaway.jarinfer;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 import java.io.BufferedReader;
@@ -46,7 +48,9 @@ public final class BytecodeAnnotator {
   private static boolean debug = false;
 
   private static void LOG(boolean cond, String tag, String msg) {
-    if (cond) System.out.println("[" + tag + "] " + msg);
+    if (cond) {
+      System.out.println("[" + tag + "] " + msg);
+    }
   }
 
   public static final String javaxNullableDesc = "Ljavax/annotation/Nullable;";
@@ -168,11 +172,9 @@ public final class BytecodeAnnotator {
       }
       Set<Integer> params = nonnullParams.get(methodSignature);
       if (params != null) {
-        boolean isStatic = (method.access & Opcodes.ACC_STATIC) != 0;
         for (Integer param : params) {
-          int paramNum = isStatic ? param : param - 1;
           // Add a @Nonnull annotation on this parameter.
-          method.visitParameterAnnotation(paramNum, nonnullDesc, visible);
+          method.visitParameterAnnotation(param, nonnullDesc, visible);
           LOG(
               debug,
               "DEBUG",
@@ -208,6 +210,18 @@ public final class BytecodeAnnotator {
     annotateBytecode(is, os, nonnullParams, nullableReturns, javaxNullableDesc, javaxNonnullDesc);
   }
 
+  /**
+   * Create a zip entry with creation time of 0 to ensure that jars always have the same checksum.
+   *
+   * @param name of the zip entry.
+   * @return the zip entry.
+   */
+  private static ZipEntry createZipEntry(String name) {
+    ZipEntry entry = new ZipEntry(name);
+    entry.setTime(0);
+    return entry;
+  }
+
   private static void copyAndAnnotateJarEntry(
       JarEntry jarEntry,
       InputStream is,
@@ -220,12 +234,12 @@ public final class BytecodeAnnotator {
       throws IOException {
     String entryName = jarEntry.getName();
     if (entryName.endsWith(".class")) {
-      jarOS.putNextEntry(new ZipEntry(jarEntry.getName()));
+      jarOS.putNextEntry(createZipEntry(jarEntry.getName()));
       annotateBytecode(is, jarOS, nonnullParams, nullableReturns, nullableDesc, nonnullDesc);
     } else if (entryName.equals("META-INF/MANIFEST.MF")) {
       // Read full file
       StringBuilder stringBuilder = new StringBuilder();
-      BufferedReader br = new BufferedReader(new InputStreamReader(is, "UTF-8"));
+      BufferedReader br = new BufferedReader(new InputStreamReader(is, UTF_8));
       String currentLine;
       while ((currentLine = br.readLine()) != null) {
         stringBuilder.append(currentLine + "\n");
@@ -233,12 +247,16 @@ public final class BytecodeAnnotator {
       String manifestText = stringBuilder.toString();
       // Check for evidence of jar signing, note that lines can be split if too long so regex
       // matching line by line will have false negatives.
+      // NOTE: this code only handles the case where the message digest algorithm used when signing
+      // was SHA-256.  Eventually we may need a more robust solution for other digest algorithms.
+      // E.g., on JDK 21, the default message digest algorithm is SHA-384, and this code does not
+      // work for that algorithm (the DIGEST_ENTRY_PATTERN regex is hardcoded for SHA-256)
       String manifestMinusDigests = manifestText.replaceAll(DIGEST_ENTRY_PATTERN, "");
       if (!manifestText.equals(manifestMinusDigests) && !stripJarSignatures) {
         throw new SignedJarException(SIGNED_JAR_ERROR_MESSAGE);
       }
-      jarOS.putNextEntry(new ZipEntry(jarEntry.getName()));
-      jarOS.write(manifestMinusDigests.getBytes("UTF-8"));
+      jarOS.putNextEntry(createZipEntry(jarEntry.getName()));
+      jarOS.write(manifestMinusDigests.getBytes(UTF_8));
     } else if (entryName.startsWith("META-INF/")
         && (entryName.endsWith(".DSA")
             || entryName.endsWith(".RSA")
@@ -247,7 +265,7 @@ public final class BytecodeAnnotator {
         throw new SignedJarException(SIGNED_JAR_ERROR_MESSAGE);
       } // the case where stripJarSignatures==true is handled by default by skipping these files
     } else {
-      jarOS.putNextEntry(new ZipEntry(jarEntry.getName()));
+      jarOS.putNextEntry(createZipEntry(jarEntry.getName()));
       jarOS.write(IOUtils.toByteArray(is));
     }
     jarOS.closeEntry();
@@ -325,7 +343,7 @@ public final class BytecodeAnnotator {
     while (zipIterator.hasNext()) {
       ZipEntry zipEntry = zipIterator.next();
       InputStream is = inputZip.getInputStream(zipEntry);
-      zipOS.putNextEntry(new ZipEntry(zipEntry.getName()));
+      zipOS.putNextEntry(createZipEntry(zipEntry.getName()));
       if (zipEntry.getName().equals("classes.jar")) {
         JarInputStream jarIS = new JarInputStream(is);
         JarEntry inputJarEntry = jarIS.getNextJarEntry();
